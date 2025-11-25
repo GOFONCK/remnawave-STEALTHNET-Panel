@@ -28,6 +28,9 @@ API_URL = os.getenv("API_URL")
 DEFAULT_SQUAD_ID = os.getenv("DEFAULT_SQUAD_ID")
 YOUR_SERVER_IP_OR_DOMAIN = os.getenv("YOUR_SERVER_IP")
 FERNET_KEY_STR = os.getenv("FERNET_KEY")
+BOT_API_URL = os.getenv("BOT_API_URL", "")  # URL веб-API бота (например, http://localhost:8080)
+BOT_API_TOKEN = os.getenv("BOT_API_TOKEN", "")  # Токен для доступа к API бота
+TELEGRAM_BOT_NAME = os.getenv("TELEGRAM_BOT_NAME", "")  # Имя бота для Telegram Login Widget
 
 app = Flask(__name__)
 
@@ -72,15 +75,17 @@ mail = Mail(app)
 # ----------------------------------------------------
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    email = db.Column(db.String(120), unique=True, nullable=False)
-    password_hash = db.Column(db.String(128), nullable=False)
+    email = db.Column(db.String(120), unique=True, nullable=True)  # Nullable для Telegram пользователей
+    password_hash = db.Column(db.String(128), nullable=True)  # Nullable для Telegram пользователей
+    telegram_id = db.Column(db.BigInteger, unique=True, nullable=True)  # Telegram ID пользователя
+    telegram_username = db.Column(db.String(100), nullable=True)  # Telegram username
     remnawave_uuid = db.Column(db.String(128), unique=True, nullable=False)
     role = db.Column(db.String(10), nullable=False, default='CLIENT') 
     referral_code = db.Column(db.String(20), unique=True, nullable=True) 
     referrer_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=True) 
     preferred_lang = db.Column(db.String(5), default='ru')
     preferred_currency = db.Column(db.String(5), default='uah')
-    is_verified = db.Column(db.Boolean, nullable=False, default=False)
+    is_verified = db.Column(db.Boolean, nullable=False, default=True)  # Telegram пользователи считаются верифицированными
     verification_token = db.Column(db.String(100), unique=True, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
 
@@ -204,6 +209,40 @@ def decrypt_key(key):
     try: return fernet.decrypt(key).decode('utf-8')
     except Exception: return ""
 
+def sync_subscription_to_bot_in_background(app_context, remnawave_uuid):
+    """Синхронизирует подписку пользователя из RemnaWave в бота в фоновом режиме"""
+    with app_context:
+        try:
+            if not BOT_API_URL or not BOT_API_TOKEN:
+                print(f"⚠️ Bot API not configured, skipping sync for {remnawave_uuid}")
+                return
+            
+            bot_api_url = BOT_API_URL.rstrip('/')
+            sync_url = f"{bot_api_url}/remnawave/sync/from-panel"
+            sync_headers = {"X-API-Key": BOT_API_TOKEN, "Content-Type": "application/json"}
+            
+            print(f"Background sync: Syncing subscription to bot for user {remnawave_uuid}...")
+            # Увеличиваем таймаут до 60 секунд для синхронизации всех пользователей
+            # Отправляем пустой JSON объект, так как эндпоинт требует body
+            sync_response = requests.post(
+                sync_url, 
+                headers=sync_headers, 
+                json={},  # Отправляем пустой JSON объект, так как эндпоинт требует body
+                timeout=60
+            )
+            
+            if sync_response.status_code == 200:
+                print(f"✓ Background sync: Subscription synced to bot for user {remnawave_uuid}")
+            else:
+                print(f"⚠️ Background sync failed: Status {sync_response.status_code}")
+                print(f"   Response: {sync_response.text[:200]}")
+        except requests.Timeout:
+            print(f"⚠️ Background sync timeout for user {remnawave_uuid} (sync takes too long)")
+        except Exception as e:
+            print(f"⚠️ Background sync error for user {remnawave_uuid}: {e}")
+            import traceback
+            traceback.print_exc()
+
 def apply_referrer_bonus_in_background(app_context, referrer_uuid, bonus_days):
     with app_context: 
         try:
@@ -245,6 +284,7 @@ def public_register():
     if not email or not password: 
         return jsonify({"message": "Требуется адрес электронной почты и пароль"}), 400
         
+    # Проверяем существование пользователя по email (email обязателен для обычной регистрации)
     if User.query.filter_by(email=email).first(): return jsonify({"message": "User exists"}), 400
 
     hashed_password = bcrypt.generate_password_hash(password).decode('utf-8')
@@ -321,7 +361,13 @@ def client_login():
     
     try:
         user = User.query.filter_by(email=email).first()
-        if not user or not bcrypt.check_password_hash(user.password_hash, password):
+        if not user:
+            return jsonify({"message": "Invalid credentials"}), 401
+        # Проверяем, что у пользователя есть пароль (не Telegram пользователь)
+        # Пустая строка также означает Telegram пользователя (для совместимости со старой БД)
+        if not user.password_hash or user.password_hash == '':
+            return jsonify({"message": "This account uses Telegram login"}), 401
+        if not bcrypt.check_password_hash(user.password_hash, password):
             return jsonify({"message": "Invalid credentials"}), 401
         if not user.is_verified:
             return jsonify({"message": "Электронная почта не подтверждена", "code": "NOT_VERIFIED"}), 403 
@@ -331,22 +377,810 @@ def client_login():
         print(f"Login Error: {e}")
         return jsonify({"message": "Internal Server Error"}), 500
 
+@app.route('/api/public/telegram-login', methods=['POST'])
+@limiter.limit("10 per minute")
+def telegram_login():
+    """
+    Авторизация через Telegram.
+    Принимает данные от Telegram Login Widget и проверяет их через API бота.
+    """
+    data = request.json
+    telegram_id = data.get('id')
+    first_name = data.get('first_name', '')
+    last_name = data.get('last_name', '')
+    username = data.get('username', '')
+    hash_value = data.get('hash')
+    auth_date = data.get('auth_date')
+    
+    if not telegram_id or not hash_value:
+        return jsonify({"message": "Invalid Telegram data"}), 400
+    
+    try:
+        # Проверяем, существует ли пользователь с таким telegram_id
+        user = User.query.filter_by(telegram_id=telegram_id).first()
+        
+        if not user:
+            # Пытаемся найти пользователя через API бота
+            if BOT_API_URL and BOT_API_TOKEN:
+                try:
+                    # Нормализуем URL - убираем лишние слэши
+                    bot_api_url = BOT_API_URL.rstrip('/')
+                    
+                    # Пробуем оба формата заголовков (X-API-Key и Authorization: Bearer)
+                    headers_list = [
+                        {"X-API-Key": BOT_API_TOKEN},
+                        {"Authorization": f"Bearer {BOT_API_TOKEN}"}
+                    ]
+                    
+                    bot_resp = None
+                    for headers in headers_list:
+                        # Пробуем прямой запрос по telegram_id (GET /users/{telegram_id})
+                        url = f"{bot_api_url}/users/{telegram_id}"
+                        header_format = list(headers.keys())[0]
+                        print(f"Requesting bot API (direct): {url} with {header_format}")
+                        bot_resp = requests.get(url, headers=headers, timeout=10)
+                        
+                        if bot_resp.status_code == 200:
+                            print(f"Success with {header_format}")
+                            break
+                        elif bot_resp.status_code == 401:
+                            print(f"401 with {header_format}, trying next format...")
+                            continue
+                        else:
+                            # Для других ошибок тоже продолжаем попытки
+                            break
+                    
+                    # Если не получилось, пробуем через список с фильтром с тем же форматом заголовка
+                    if not bot_resp or bot_resp.status_code != 200:
+                        print(f"Direct request failed, trying list with filter...")
+                        headers = headers_list[0]  # Используем первый формат
+                        bot_resp = requests.get(
+                            f"{bot_api_url}/users",
+                            headers=headers,
+                            params={"telegram_id": telegram_id},
+                            timeout=10
+                        )
+                    
+                    print(f"Bot API Response: Status {bot_resp.status_code}")
+                    
+                    if bot_resp.status_code == 200:
+                        try:
+                            bot_data = bot_resp.json()
+                        except Exception as e:
+                            print(f"Bot API JSON Parse Error: {e}")
+                            print(f"Bot API Response: {bot_resp.text[:500]}")
+                            return jsonify({"message": "Неверный формат ответа от API бота"}), 500
+                        
+                        # Обрабатываем ответ в зависимости от формата
+                        bot_user = None
+                        
+                        # Формат 1: Прямой ответ с пользователем (GET /users/{id})
+                        if isinstance(bot_data, dict) and 'response' in bot_data:
+                            response_data = bot_data.get('response', {})
+                            if isinstance(response_data, dict) and (response_data.get('telegram_id') == telegram_id or response_data.get('id') or response_data.get('uuid')):
+                                bot_user = response_data
+                        
+                        # Формат 2: Объект пользователя напрямую
+                        elif isinstance(bot_data, dict) and (bot_data.get('telegram_id') == telegram_id or bot_data.get('id') or bot_data.get('uuid')):
+                            bot_user = bot_data
+                        
+                        # Формат 3: Список пользователей с фильтром
+                        elif isinstance(bot_data, dict) and 'items' in bot_data:
+                            for u in bot_data.get('items', []):
+                                if isinstance(u, dict) and u.get('telegram_id') == telegram_id:
+                                    bot_user = u
+                                    break
+                        
+                        # Формат 4: Список пользователей в 'response'
+                        elif isinstance(bot_data, dict) and 'response' in bot_data:
+                            response_data = bot_data.get('response', {})
+                            if isinstance(response_data, dict) and 'items' in response_data:
+                                for u in response_data.get('items', []):
+                                    if isinstance(u, dict) and u.get('telegram_id') == telegram_id:
+                                        bot_user = u
+                                        break
+                            elif isinstance(response_data, list):
+                                for u in response_data:
+                                    if isinstance(u, dict) and u.get('telegram_id') == telegram_id:
+                                        bot_user = u
+                                        break
+                        
+                        # Формат 5: Список пользователей напрямую
+                        elif isinstance(bot_data, list):
+                            for u in bot_data:
+                                if isinstance(u, dict) and u.get('telegram_id') == telegram_id:
+                                    bot_user = u
+                                    break
+                        
+                        if bot_user:
+                            # Пытаемся получить remnawave_uuid из разных источников
+                            remnawave_uuid = bot_user.get('remnawave_uuid') or bot_user.get('uuid')
+                            
+                            # Если UUID не найден напрямую, пробуем получить через RemnaWave API
+                            if not remnawave_uuid:
+                                print(f"Bot user found but no remnawave_uuid in response, trying to get from RemnaWave...")
+                                
+                                # Вариант 1: Получить данные пользователя через /users/{id} где id может быть telegram_id
+                                # Согласно документации API бота: GET /users/{id} - ID может быть как внутренним (user.id), так и Telegram ID
+                                try:
+                                    print(f"Trying to get user data from bot API using telegram_id as id: {telegram_id}")
+                                    for headers in headers_list:
+                                        header_format = list(headers.keys())[0]
+                                        bot_user_resp = requests.get(
+                                            f"{bot_api_url}/users/{telegram_id}",
+                                            headers=headers,
+                                            timeout=10
+                                        )
+                                        if bot_user_resp.status_code == 200:
+                                            bot_user_full = bot_user_resp.json()
+                                            # Парсим ответ в зависимости от формата
+                                            if isinstance(bot_user_full, dict):
+                                                user_data = bot_user_full.get('response', {}) if 'response' in bot_user_full else bot_user_full
+                                                # Пробуем найти стандартный UUID (не shortUUID)
+                                                # UUID должен быть в формате: be7d4bb9-f083-4733-90e0-5dbab253335c
+                                                potential_uuid = (user_data.get('remnawave_uuid') or 
+                                                                 user_data.get('uuid') or
+                                                                 user_data.get('remnawave_uuid') or
+                                                                 user_data.get('user_uuid'))
+                                                
+                                                if potential_uuid and '-' in potential_uuid and len(potential_uuid) >= 36:
+                                                    remnawave_uuid = potential_uuid
+                                                    print(f"✓ Found standard UUID from bot API /users/{telegram_id}: {remnawave_uuid}")
+                                                    break
+                                                elif potential_uuid:
+                                                    print(f"⚠️  Found non-standard UUID format from bot API: {potential_uuid[:20]}...")
+                                        elif bot_user_resp.status_code == 401:
+                                            print(f"401 with {header_format}, trying next format...")
+                                            continue
+                                        else:
+                                            print(f"Bot API /users/{telegram_id} returned status {bot_user_resp.status_code}")
+                                            break
+                                except Exception as e:
+                                    print(f"Failed to get UUID from bot API /users/{telegram_id}: {e}")
+                                
+                                # Вариант 1.1: Получить через эндпоинт /remnawave/users/{telegram_id}/traffic
+                                if not remnawave_uuid:
+                                    try:
+                                        remnawave_resp = requests.get(
+                                            f"{bot_api_url}/remnawave/users/{telegram_id}/traffic",
+                                            headers=headers_list[0],  # Используем первый формат заголовка
+                                            timeout=5
+                                        )
+                                        if remnawave_resp.status_code == 200:
+                                            remnawave_data = remnawave_resp.json()
+                                            # Пробуем найти UUID в ответе (проверяем формат)
+                                            if isinstance(remnawave_data, dict):
+                                                potential_uuid = remnawave_data.get('uuid') or remnawave_data.get('response', {}).get('uuid')
+                                                if potential_uuid and '-' in potential_uuid and len(potential_uuid) >= 36:
+                                                    remnawave_uuid = potential_uuid
+                                                    print(f"✓ Found standard UUID from /remnawave/users/{telegram_id}/traffic: {remnawave_uuid}")
+                                    except Exception as e:
+                                        print(f"Failed to get UUID from RemnaWave endpoint: {e}")
+                                
+                                # Вариант 2: Получить UUID через подписку пользователя в боте
+                                if not remnawave_uuid:
+                                    subscription = bot_user.get('subscription', {})
+                                    if subscription and isinstance(subscription, dict):
+                                        # Попытка 2.1: Извлечь UUID из subscription_url (если там он есть)
+                                        subscription_url = subscription.get('subscription_url', '')
+                                        if subscription_url:
+                                            # subscription_url имеет формат: https://admin.stealthnet.app/{UUID}
+                                            # Пробуем извлечь UUID из URL
+                                            import re
+                                            url_parts = subscription_url.split('/')
+                                            if len(url_parts) > 0:
+                                                potential_uuid = url_parts[-1]  # Последняя часть URL
+                                                # Проверяем, что это похоже на UUID (не пустой, не слишком короткий)
+                                                if potential_uuid and len(potential_uuid) > 10:
+                                                    # Проверяем, является ли это стандартным UUID (содержит дефисы) или shortUUID
+                                                    # Стандартный UUID формат: be7d4bb9-f083-4733-90e0-5dbab253335c (с дефисами)
+                                                    # ShortUUID формат: aBtzyf4hQgycgvN4 (без дефисов, короткий)
+                                                    if '-' in potential_uuid and len(potential_uuid) > 30:
+                                                        # Это стандартный UUID - используем напрямую
+                                                        remnawave_uuid = potential_uuid
+                                                        print(f"✓ Found standard UUID in subscription_url: {remnawave_uuid}")
+                                                    else:
+                                                        # Это shortUUID - сохраняем для поиска в RemnaWave API
+                                                        short_uuid_from_url = potential_uuid
+                                                        print(f"✓ Found shortUUID in subscription_url: {short_uuid_from_url}")
+                                                        print(f"   Will search for user with this shortUUID in RemnaWave API...")
+                                                        
+                                                        # Получаем пользователя из RemnaWave API по shortUUID
+                                                        # Согласно документации RemnaWave API: GET /api/users/by-short-uuid/{shortUuid}
+                                                        if API_URL and ADMIN_TOKEN:
+                                                            try:
+                                                                print(f"Fetching user from RemnaWave API by shortUUID: {short_uuid_from_url}")
+                                                                
+                                                                # Используем прямой эндпоинт для получения пользователя по shortUUID
+                                                                remnawave_short_uuid_resp = requests.get(
+                                                                    f"{API_URL}/api/users/by-short-uuid/{short_uuid_from_url}",
+                                                                    headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                                                                    timeout=10
+                                                                )
+                                                                
+                                                                if remnawave_short_uuid_resp.status_code == 200:
+                                                                    remnawave_short_uuid_data = remnawave_short_uuid_resp.json()
+                                                                    
+                                                                    # Парсим ответ в зависимости от формата
+                                                                    user_data = remnawave_short_uuid_data.get('response', {}) if isinstance(remnawave_short_uuid_data, dict) and 'response' in remnawave_short_uuid_data else remnawave_short_uuid_data
+                                                                    
+                                                                    # Получаем стандартный UUID пользователя
+                                                                    potential_uuid = user_data.get('uuid') if isinstance(user_data, dict) else None
+                                                                    
+                                                                    if potential_uuid and '-' in potential_uuid and len(potential_uuid) >= 36:
+                                                                        remnawave_uuid = potential_uuid
+                                                                        print(f"✓ Found remnawave_uuid by shortUUID endpoint: {remnawave_uuid}")
+                                                                    else:
+                                                                        print(f"⚠️  Invalid UUID format in RemnaWave API response: {potential_uuid}")
+                                                                elif remnawave_short_uuid_resp.status_code == 404:
+                                                                    print(f"⚠️  User with shortUUID {short_uuid_from_url} not found in RemnaWave API (404)")
+                                                                else:
+                                                                    print(f"⚠️  Failed to fetch user by shortUUID: Status {remnawave_short_uuid_resp.status_code}")
+                                                                    print(f"   Falling back to fetching all users...")
+                                                                    
+                                                                    # Fallback: получаем всех пользователей, если прямой эндпоинт не сработал
+                                                                    print(f"Fetching all users from RemnaWave API to find user with shortUUID: {short_uuid_from_url}")
+                                                                    remnawave_all_resp = requests.get(
+                                                                        f"{API_URL}/api/users",
+                                                                        headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                                                                        timeout=15
+                                                                    )
+                                                                    
+                                                                    if remnawave_all_resp.status_code == 200:
+                                                                        remnawave_all_data = remnawave_all_resp.json()
+                                                                        # Парсим ответ в зависимости от формата
+                                                                        all_users_list = []
+                                                                        if isinstance(remnawave_all_data, dict):
+                                                                            response_data = remnawave_all_data.get('response', {})
+                                                                            if isinstance(response_data, dict):
+                                                                                all_users_list = response_data.get('users', [])
+                                                                            elif isinstance(response_data, list):
+                                                                                all_users_list = response_data
+                                                                        elif isinstance(remnawave_all_data, list):
+                                                                            all_users_list = remnawave_all_data
+                                                                    
+                                                                    print(f"Searching in {len(all_users_list)} RemnaWave users for shortUUID: {short_uuid_from_url}")
+                                                                    
+                                                                    # Ищем пользователя, у которого shortUUID совпадает
+                                                                    # shortUUID может быть в subscription_url, short_uuid, или других полях
+                                                                    for rw_user in all_users_list:
+                                                                        if isinstance(rw_user, dict):
+                                                                            rw_uuid = rw_user.get('uuid')
+                                                                            
+                                                                            # Проверяем, что UUID в правильном формате
+                                                                            if rw_uuid and '-' in rw_uuid and len(rw_uuid) >= 36:
+                                                                                # Проверяем различные поля, где может быть shortUUID
+                                                                                # 1. В subscription_url
+                                                                                subscriptions = rw_user.get('subscriptions', []) or []
+                                                                                for sub in subscriptions:
+                                                                                    if isinstance(sub, dict):
+                                                                                        sub_url = sub.get('url', '') or sub.get('subscription_url', '') or sub.get('link', '')
+                                                                                        if short_uuid_from_url in sub_url:
+                                                                                            remnawave_uuid = rw_uuid
+                                                                                            print(f"✓ Found remnawave_uuid by shortUUID in subscription_url: {remnawave_uuid}")
+                                                                                            break
+                                                                                
+                                                                                if remnawave_uuid:
+                                                                                    break
+                                                                                
+                                                                                # 2. В поле short_uuid или shortUuid
+                                                                                if (rw_user.get('short_uuid') == short_uuid_from_url or 
+                                                                                    rw_user.get('shortUuid') == short_uuid_from_url or
+                                                                                    rw_user.get('short_uuid') == short_uuid_from_url):
+                                                                                    remnawave_uuid = rw_uuid
+                                                                                    print(f"✓ Found remnawave_uuid by shortUUID field: {remnawave_uuid}")
+                                                                                    break
+                                                                                
+                                                                                # 3. В metadata или customFields
+                                                                                metadata = rw_user.get('metadata', {}) or {}
+                                                                                custom_fields = rw_user.get('customFields', {}) or {}
+                                                                                if (metadata.get('short_uuid') == short_uuid_from_url or
+                                                                                    custom_fields.get('short_uuid') == short_uuid_from_url or
+                                                                                    custom_fields.get('shortUuid') == short_uuid_from_url):
+                                                                                    remnawave_uuid = rw_uuid
+                                                                                    print(f"✓ Found remnawave_uuid by shortUUID in metadata/customFields: {remnawave_uuid}")
+                                                                                    break
+                                                                    
+                                                                        if not remnawave_uuid:
+                                                                            print(f"⚠️  User with shortUUID {short_uuid_from_url} not found in RemnaWave API")
+                                                                            print(f"   Searched in {len(all_users_list)} users")
+                                                                    else:
+                                                                        print(f"Failed to fetch users from RemnaWave API: Status {remnawave_all_resp.status_code}")
+                                                            except Exception as e:
+                                                                print(f"Error searching for user by shortUUID in RemnaWave API: {e}")
+                                                                import traceback
+                                                                traceback.print_exc()
+                                        
+                                        # Попытка 2.2: Получить UUID через эндпоинт подписки
+                                        if not remnawave_uuid:
+                                            subscription_id = subscription.get('id')
+                                            if subscription_id:
+                                                try:
+                                                    sub_resp = requests.get(
+                                                        f"{bot_api_url}/subscriptions/{subscription_id}",
+                                                        headers=headers_list[0],
+                                                        timeout=5
+                                                    )
+                                                    if sub_resp.status_code == 200:
+                                                        sub_data = sub_resp.json()
+                                                        # Пробуем найти UUID в ответе
+                                                        if isinstance(sub_data, dict):
+                                                            response_data = sub_data.get('response', {}) if 'response' in sub_data else sub_data
+                                                            remnawave_uuid = (response_data.get('uuid') or 
+                                                                             response_data.get('remnawave_uuid') or
+                                                                             response_data.get('user_uuid') or
+                                                                             response_data.get('remnawave_user_uuid'))
+                                                            if remnawave_uuid:
+                                                                print(f"Found remnawave_uuid from subscription endpoint: {remnawave_uuid}")
+                                                except Exception as e:
+                                                    print(f"Failed to get UUID from subscription endpoint: {e}")
+                            
+                            # Вариант 3: Попробовать найти пользователя в RemnaWave API напрямую по telegram_id
+                                # Согласно документации RemnaWave API: GET /api/users поддерживает фильтрацию
+                                if not remnawave_uuid and API_URL and ADMIN_TOKEN:
+                                    try:
+                                        # Получаем список всех пользователей из RemnaWave
+                                        remnawave_resp = requests.get(
+                                            f"{API_URL}/api/users",
+                                            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                                            timeout=10
+                                        )
+                                        if remnawave_resp.status_code == 200:
+                                            remnawave_data = remnawave_resp.json()
+                                            # Парсим ответ в зависимости от формата
+                                            users_list = []
+                                            if isinstance(remnawave_data, dict):
+                                                response_data = remnawave_data.get('response', {})
+                                                if isinstance(response_data, dict):
+                                                    users_list = response_data.get('users', [])
+                                                elif isinstance(response_data, list):
+                                                    users_list = response_data
+                                            elif isinstance(remnawave_data, list):
+                                                users_list = remnawave_data
+                                            
+                                            print(f"Searching for user with telegram_id {telegram_id} in {len(users_list)} RemnaWave users...")
+                                            
+                                            # Ищем пользователя по telegram_id (если он есть в RemnaWave)
+                                            # Согласно документации RemnaWave API, можно искать по разным полям
+                                            bot_email = bot_user.get('email') or f"tg_{telegram_id}@telegram.local"
+                                            bot_username = bot_user.get('username') or bot_user.get('first_name', '')
+                                            
+                                            print(f"Searching in {len(users_list)} RemnaWave users for telegram_id: {telegram_id}")
+                                            
+                                            for u in users_list:
+                                                if isinstance(u, dict):
+                                                    uuid_value = u.get('uuid')
+                                                    
+                                                    # Проверяем, что UUID в правильном формате (стандартный UUID с дефисами)
+                                                    # Стандартный UUID: be7d4bb9-f083-4733-90e0-5dbab253335c (36 символов с дефисами)
+                                                    # ShortUUID: aBtzyf4hQgycgvN4 (без дефисов, короткий)
+                                                    if uuid_value and '-' in uuid_value and len(uuid_value) >= 36:
+                                                        # Приоритет 1: Проверяем по telegram_id (если поле есть в RemnaWave)
+                                                        # Согласно документации RemnaWave, telegram_id может быть в разных полях
+                                                        user_telegram_id = (u.get('telegram_id') or 
+                                                                           u.get('metadata', {}).get('telegram_id') or
+                                                                           u.get('customFields', {}).get('telegram_id') or
+                                                                           u.get('customFields', {}).get('telegramId'))
+                                                        if user_telegram_id and str(user_telegram_id) == str(telegram_id):
+                                                            remnawave_uuid = uuid_value
+                                                            print(f"✓ Found remnawave_uuid by telegram_id: {remnawave_uuid}")
+                                                            break
+                                                        
+                                                        # Приоритет 2: Проверяем по email
+                                                        if u.get('email') and u.get('email') == bot_email:
+                                                            remnawave_uuid = uuid_value
+                                                            print(f"✓ Found remnawave_uuid by email: {remnawave_uuid}")
+                                                            break
+                                                        
+                                                        # Приоритет 3: Проверяем по username (точное или частичное совпадение)
+                                                        if bot_username and u.get('username'):
+                                                            user_username = u.get('username', '').lower()
+                                                            bot_username_lower = bot_username.lower()
+                                                            if user_username == bot_username_lower or bot_username_lower in user_username:
+                                                                remnawave_uuid = uuid_value
+                                                                print(f"✓ Found remnawave_uuid by username: {remnawave_uuid}")
+                                                                break
+                                                    elif uuid_value:
+                                                        # Если UUID в нестандартном формате, пропускаем его
+                                                        print(f"⚠️  Skipping user with non-standard UUID format: {uuid_value[:20]}...")
+                                            
+                                            if not remnawave_uuid:
+                                                print(f"⚠️  User not found in RemnaWave API by telegram_id ({telegram_id}), email, or username")
+                                                print(f"   Searched in {len(users_list)} users")
+                                                # Выводим несколько примеров для отладки
+                                                if users_list:
+                                                    print(f"   Sample users (first 3): {[{'uuid': u.get('uuid'), 'email': u.get('email'), 'username': u.get('username'), 'telegram_id': u.get('telegram_id')} for u in users_list[:3] if isinstance(u, dict)]}")
+                                    except Exception as e:
+                                        print(f"Failed to find user in RemnaWave API: {e}")
+                                        import traceback
+                                        traceback.print_exc()
+                            
+                            # Если UUID все еще не найден, возвращаем ошибку
+                            if not remnawave_uuid:
+                                print(f"Bot user found but no remnawave_uuid: {bot_user}")
+                                return jsonify({
+                                    "message": "Пользователь найден в боте, но не найден в RemnaWave. Обратитесь к администратору или синхронизируйте данные бота с RemnaWave.",
+                                    "details": "Возможно, пользователь не был синхронизирован с RemnaWave панелью."
+                                }), 404
+                            
+                            # Проверяем, не существует ли уже пользователь с таким remnawave_uuid
+                            existing_user = User.query.filter_by(remnawave_uuid=remnawave_uuid).first()
+                            if existing_user:
+                                # Обновляем существующего пользователя
+                                existing_user.telegram_id = telegram_id
+                                existing_user.telegram_username = username
+                                if not existing_user.email:
+                                    existing_user.email = f"tg_{telegram_id}@telegram.local"  # Временный email
+                                # Обновляем password_hash для совместимости, если это Telegram пользователь
+                                if not existing_user.password_hash:
+                                    existing_user.password_hash = ''  # Пустая строка для Telegram пользователей
+                                db.session.commit()
+                                user = existing_user
+                                print(f"Telegram user linked to existing user: {user.id}")
+                            else:
+                                # Создаем нового пользователя
+                                sys_settings = SystemSetting.query.first() or SystemSetting(id=1)
+                                if not sys_settings.id:
+                                    db.session.add(sys_settings)
+                                    db.session.flush()
+                                
+                                # Для Telegram пользователей создаем пустой password_hash
+                                # Если БД еще не обновлена (password_hash NOT NULL), используем пустую строку
+                                # В идеале должно быть None, но для совместимости со старой структурой БД используем ''
+                                user = User(
+                                    telegram_id=telegram_id,
+                                    telegram_username=username,
+                                    email=f"tg_{telegram_id}@telegram.local",  # Временный email
+                                    password_hash='',  # Telegram пользователи не используют пароль (используем '' для совместимости со старой БД)
+                                    remnawave_uuid=remnawave_uuid,
+                                    is_verified=True,  # Telegram пользователи считаются верифицированными
+                                    preferred_lang=sys_settings.default_language,
+                                    preferred_currency=sys_settings.default_currency
+                                )
+                                db.session.add(user)
+                                db.session.flush()
+                                user.referral_code = generate_referral_code(user.id)
+                                db.session.commit()
+                                
+                                # Очищаем кэш для нового пользователя, чтобы данные загрузились сразу
+                                cache.delete(f'live_data_{remnawave_uuid}')
+                                cache.delete(f'nodes_{remnawave_uuid}')
+                                cache.delete('all_live_users_map')  # Очищаем общий кэш
+                                print(f"New Telegram user created: {user.id}, telegram_id: {telegram_id}, remnawave_uuid: {remnawave_uuid}")
+                        else:
+                            print(f"User with telegram_id {telegram_id} not found in bot response")
+                            print(f"Bot API response structure: {type(bot_data)}")
+                            if isinstance(bot_data, dict):
+                                print(f"Bot API response keys: {list(bot_data.keys())}")
+                            return jsonify({"message": "Пользователь не найден в боте. Убедитесь, что вы зарегистрированы через Telegram бота."}), 404
+                    else:
+                        error_text = bot_resp.text[:500] if hasattr(bot_resp, 'text') else 'No error details'
+                        print(f"Bot API Error: Status {bot_resp.status_code}, Response: {error_text}")
+                        
+                        error_msg = "Ошибка подключения к API бота"
+                        if bot_resp.status_code == 401:
+                            error_msg = f"Неверный токен API бота (401). Проверьте BOT_API_TOKEN в .env файле. Ответ API: {error_text}"
+                        elif bot_resp.status_code == 404:
+                            error_msg = f"Пользователь не найден в API бота (404). Проверьте, что вы зарегистрированы через Telegram бота. Ответ API: {error_text}"
+                        elif bot_resp.status_code == 403:
+                            error_msg = "Доступ к API бота запрещен. Проверьте токен и права доступа."
+                        else:
+                            error_msg = f"Ошибка API бота (код {bot_resp.status_code}): {error_text}"
+                        
+                        return jsonify({"message": error_msg}), 500
+                except requests.Timeout:
+                    print(f"Bot API Timeout: {BOT_API_URL}")
+                    return jsonify({"message": "Таймаут подключения к API бота. Проверьте доступность сервера."}), 500
+                except requests.ConnectionError as e:
+                    print(f"Bot API Connection Error: {e}")
+                    return jsonify({"message": "Не удалось подключиться к API бота. Проверьте BOT_API_URL в настройках."}), 500
+                except requests.RequestException as e:
+                    print(f"Bot API Request Error: {e}")
+                    return jsonify({"message": f"Ошибка запроса к API бота: {str(e)[:100]}"}), 500
+            else:
+                return jsonify({"message": "Bot API not configured"}), 500
+        
+        # Обновляем username если изменился
+        if username and user.telegram_username != username:
+            user.telegram_username = username
+            db.session.commit()
+        
+        # Очищаем кэш для пользователя, чтобы данные обновились после входа
+        cache.delete(f'live_data_{user.remnawave_uuid}')
+        cache.delete(f'nodes_{user.remnawave_uuid}')
+        
+        return jsonify({"token": create_local_jwt(user.id), "role": user.role}), 200
+        
+    except Exception as e:
+        print(f"Telegram Login Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Internal Server Error"}), 500
+
 @app.route('/api/client/me', methods=['GET'])
 def get_client_me():
     user = get_user_from_token()
     if not user: return jsonify({"message": "Ошибка аутентификации"}), 401
     
-    cache_key = f'live_data_{user.remnawave_uuid}'
-    if cached := cache.get(cache_key): return jsonify({"response": cached}), 200
+    # Проверяем, является ли UUID shortUUID (без дефисов или слишком короткий)
+    # Если это shortUUID, пытаемся найти стандартный UUID
+    current_uuid = user.remnawave_uuid
+    is_short_uuid = (not current_uuid or 
+                     '-' not in current_uuid or 
+                     len(current_uuid) < 36)
+    
+    if is_short_uuid and current_uuid:
+        print(f"⚠️  User {user.id} has shortUUID: {current_uuid}")
+        print(f"   Getting user with this shortUUID from RemnaWave API...")
+        
+        # Сохраняем оригинальный shortUUID для использования в fallback логике
+        original_short_uuid = current_uuid
+        
+        # Получаем пользователя из RemnaWave API по shortUUID
+        # Согласно документации RemnaWave API: GET /api/users/by-short-uuid/{shortUuid}
+        found_uuid = None
+        if API_URL and ADMIN_TOKEN:
+            try:
+                print(f"Fetching user from RemnaWave API by shortUUID: {original_short_uuid}")
+                
+                # Используем прямой эндпоинт для получения пользователя по shortUUID
+                remnawave_short_uuid_resp = requests.get(
+                    f"{API_URL}/api/users/by-short-uuid/{original_short_uuid}",
+                    headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                    timeout=10
+                )
+                
+                if remnawave_short_uuid_resp.status_code == 200:
+                    remnawave_short_uuid_data = remnawave_short_uuid_resp.json()
+                    
+                    # Парсим ответ в зависимости от формата
+                    user_data = remnawave_short_uuid_data.get('response', {}) if isinstance(remnawave_short_uuid_data, dict) and 'response' in remnawave_short_uuid_data else remnawave_short_uuid_data
+                    
+                    # Получаем стандартный UUID пользователя
+                    found_uuid = user_data.get('uuid') if isinstance(user_data, dict) else None
+                    
+                    if found_uuid and '-' in found_uuid and len(found_uuid) >= 36:
+                        # Обновляем UUID в базе данных
+                        old_uuid = user.remnawave_uuid
+                        user.remnawave_uuid = found_uuid
+                        db.session.commit()
+                        current_uuid = found_uuid
+                        
+                        # Очищаем старый кэш
+                        if old_uuid:
+                            cache.delete(f'live_data_{old_uuid}')
+                            cache.delete(f'nodes_{old_uuid}')
+                        
+                        print(f"✓ Updated UUID for user {user.id}: {old_uuid} -> {current_uuid}")
+                        # Выходим, так как UUID успешно обновлен
+                        found_uuid = True  # Флаг успешного обновления
+                    else:
+                        print(f"⚠️  Invalid UUID format in RemnaWave API response: {found_uuid}")
+                elif remnawave_short_uuid_resp.status_code == 404:
+                    print(f"⚠️  User with shortUUID {original_short_uuid} not found in RemnaWave API (404)")
+                else:
+                    print(f"⚠️  Failed to fetch user by shortUUID: Status {remnawave_short_uuid_resp.status_code}")
+                    print(f"   Response: {remnawave_short_uuid_resp.text[:200]}")
+                
+                # Если прямой эндпоинт не сработал, пробуем получить всех пользователей (fallback)
+                # Используем оригинальный shortUUID, а не обновленный UUID
+                if not found_uuid:
+                    print(f"   Falling back to fetching all users from RemnaWave API to search for shortUUID: {original_short_uuid}...")
+                    
+                    # Получаем всех пользователей с учетом пагинации
+                    all_users_list = []
+                    page = 1
+                    per_page = 100  # Запрашиваем больше пользователей за раз
+                    has_more = True
+                    
+                    while has_more:
+                        try:
+                            # Формируем параметры запроса
+                            params = {}
+                            if page > 1:
+                                params["page"] = page
+                            if per_page != 100:
+                                params["per_page"] = per_page
+                            
+                            remnawave_all_resp = requests.get(
+                                f"{API_URL}/api/users",
+                                headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+                                params=params if params else None,
+                                timeout=20
+                            )
+                            
+                            if remnawave_all_resp.status_code == 200:
+                                remnawave_all_data = remnawave_all_resp.json()
+                                
+                                # Парсим ответ в зависимости от формата
+                                page_users = []
+                                total_users = 0
+                                total_pages = 1
+                                
+                                if isinstance(remnawave_all_data, dict):
+                                    response_data = remnawave_all_data.get('response', {})
+                                    if isinstance(response_data, dict):
+                                        # Проверяем, есть ли пагинация
+                                        if 'users' in response_data:
+                                            page_users = response_data.get('users', [])
+                                        elif 'items' in response_data:
+                                            page_users = response_data.get('items', [])
+                                        else:
+                                            page_users = []
+                                        
+                                        # Проверяем метаданные пагинации
+                                        total_users = response_data.get('total', response_data.get('totalUsers', len(page_users)))
+                                        total_pages = response_data.get('totalPages', response_data.get('pages', 1))
+                                        current_page = response_data.get('page', response_data.get('currentPage', page))
+                                    elif isinstance(response_data, list):
+                                        page_users = response_data
+                                        has_more = False  # Если это список, значит пагинации нет
+                                elif isinstance(remnawave_all_data, list):
+                                    page_users = remnawave_all_data
+                                    has_more = False  # Если это список, значит пагинации нет
+                                
+                                if page_users:
+                                    all_users_list.extend(page_users)
+                                    print(f"Fetched page {page}: {len(page_users)} users (total so far: {len(all_users_list)})")
+                                    
+                                    # Проверяем, есть ли еще страницы
+                                    # Если total_pages указан и мы не на последней странице - продолжаем
+                                    if total_pages > 1 and page < total_pages:
+                                        page += 1
+                                        has_more = True
+                                        print(f"   Continuing to page {page} (total pages: {total_pages})")
+                                    elif len(page_users) < per_page:
+                                        # Если получили меньше пользователей, чем запросили, значит это последняя страница
+                                        has_more = False
+                                        print(f"   Last page reached (got {len(page_users)} < {per_page})")
+                                    elif len(page_users) == per_page:
+                                        # Если получили ровно столько, сколько запросили, возможно есть еще страницы
+                                        # Пробуем запросить следующую страницу
+                                        page += 1
+                                        has_more = True
+                                        print(f"   Got full page ({len(page_users)} users), trying page {page}...")
+                                    else:
+                                        has_more = False
+                                else:
+                                    # Если не получили пользователей, прекращаем
+                                    has_more = False
+                                    print(f"   No users on page {page}, stopping")
+                            else:
+                                print(f"Failed to fetch page {page} from RemnaWave API: Status {remnawave_all_resp.status_code}")
+                                has_more = False
+                        except requests.RequestException as e:
+                            print(f"Error fetching page {page} from RemnaWave API: {e}")
+                            has_more = False
+                
+                    # Используем оригинальный shortUUID для поиска в fallback логике
+                    print(f"Searching in {len(all_users_list)} RemnaWave users for shortUUID: {original_short_uuid}")
+                    
+                    # Ищем пользователя, у которого shortUUID совпадает
+                    found_uuid_in_list = None
+                    for rw_user in all_users_list:
+                        if isinstance(rw_user, dict):
+                            rw_uuid = rw_user.get('uuid')
+                            
+                            # Проверяем, что UUID в правильном формате
+                            if rw_uuid and '-' in rw_uuid and len(rw_uuid) >= 36:
+                                # Проверяем различные поля, где может быть shortUUID
+                                # 1. В subscription_url
+                                subscriptions = rw_user.get('subscriptions', []) or []
+                                for sub in subscriptions:
+                                    if isinstance(sub, dict):
+                                        sub_url = sub.get('url', '') or sub.get('subscription_url', '') or sub.get('link', '')
+                                        if original_short_uuid in sub_url:
+                                            found_uuid_in_list = rw_uuid
+                                            print(f"✓ Found remnawave_uuid by shortUUID in subscription_url: {found_uuid_in_list}")
+                                            break
+                                
+                                if found_uuid_in_list:
+                                    break
+                                
+                                # 2. В поле short_uuid или shortUuid
+                                if (rw_user.get('short_uuid') == original_short_uuid or 
+                                    rw_user.get('shortUuid') == original_short_uuid):
+                                    found_uuid_in_list = rw_uuid
+                                    print(f"✓ Found remnawave_uuid by shortUUID field: {found_uuid_in_list}")
+                                    break
+                                
+                                # 3. В metadata или customFields
+                                metadata = rw_user.get('metadata', {}) or {}
+                                custom_fields = rw_user.get('customFields', {}) or {}
+                                if (metadata.get('short_uuid') == original_short_uuid or
+                                    custom_fields.get('short_uuid') == original_short_uuid or
+                                    custom_fields.get('shortUuid') == original_short_uuid):
+                                    found_uuid_in_list = rw_uuid
+                                    print(f"✓ Found remnawave_uuid by shortUUID in metadata/customFields: {found_uuid_in_list}")
+                                    break
+                    
+                    # Обновляем UUID только если нашли через fallback (если прямой эндпоинт не сработал)
+                    if found_uuid_in_list:
+                        # Обновляем UUID в базе данных
+                        old_uuid = user.remnawave_uuid
+                        user.remnawave_uuid = found_uuid_in_list
+                        db.session.commit()
+                        current_uuid = found_uuid_in_list
+                        
+                        # Очищаем старый кэш
+                        if old_uuid:
+                            cache.delete(f'live_data_{old_uuid}')
+                            cache.delete(f'nodes_{old_uuid}')
+                        
+                        print(f"✓ Updated UUID for user {user.id} (fallback): {old_uuid} -> {current_uuid}")
+                    else:
+                        print(f"⚠️  User with shortUUID {original_short_uuid} not found in RemnaWave API")
+                        print(f"   Searched in {len(all_users_list)} users")
+            except Exception as e:
+                print(f"Error searching for user by shortUUID in RemnaWave API: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    cache_key = f'live_data_{current_uuid}'
+    
+    # Проверяем параметр force_refresh для принудительного обновления
+    force_refresh = request.args.get('force_refresh', 'false').lower() == 'true'
+    
+    if not force_refresh:
+        if cached := cache.get(cache_key): 
+            return jsonify({"response": cached}), 200
     
     try:
-        resp = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}", headers={"Authorization": f"Bearer {ADMIN_TOKEN}"})
-        data = resp.json().get('response', {})
-        data.update({'referral_code': user.referral_code, 'preferred_lang': user.preferred_lang, 'preferred_currency': user.preferred_currency})
+        # Согласно документации RemnaWave API: GET /api/users/{uuid}
+        # UUID должен быть стандартным (с дефисами)
+        if is_short_uuid and current_uuid:
+            return jsonify({
+                "message": f"Некорректный UUID пользователя: {current_uuid}. Обратитесь к администратору.",
+                "error": "INVALID_UUID_FORMAT"
+            }), 400
+        
+        resp = requests.get(
+            f"{API_URL}/api/users/{current_uuid}", 
+            headers={"Authorization": f"Bearer {ADMIN_TOKEN}"},
+            timeout=10
+        )
+        
+        if resp.status_code != 200:
+            print(f"RemnaWave API Error for UUID {current_uuid}: Status {resp.status_code}")
+            error_text = resp.text[:500] if hasattr(resp, 'text') else 'No error details'
+            print(f"Error response: {error_text}")
+            
+            # Если пользователь не найден, возвращаем ошибку
+            if resp.status_code == 404:
+                return jsonify({"message": f"Пользователь не найден в RemnaWave (UUID: {current_uuid}). Обратитесь к администратору."}), 404
+            
+            # Если ошибка валидации UUID (400), возможно это shortUUID
+            if resp.status_code == 400 and 'Invalid uuid' in error_text:
+                return jsonify({
+                    "message": f"Некорректный формат UUID: {current_uuid}. Обратитесь к администратору для исправления.",
+                    "error": "INVALID_UUID_FORMAT"
+                }), 400
+            
+            return jsonify({"message": f"Ошибка получения данных из RemnaWave: {resp.status_code}"}), 500
+        
+        response_data = resp.json()
+        data = response_data.get('response', {}) if isinstance(response_data, dict) else response_data
+        
+        # Добавляем данные из локальной БД
+        if isinstance(data, dict):
+            data.update({
+                'referral_code': user.referral_code, 
+                'preferred_lang': user.preferred_lang, 
+                'preferred_currency': user.preferred_currency,
+                'telegram_id': user.telegram_id,
+                'telegram_username': user.telegram_username
+            })
+        
         cache.set(cache_key, data, timeout=300)
         return jsonify({"response": data}), 200
+    except requests.RequestException as e:
+        print(f"Request Error in get_client_me: {e}")
+        return jsonify({"message": f"Ошибка подключения к RemnaWave API: {str(e)}"}), 500
     except Exception as e: 
-        print(e); return jsonify({"message": "Internal Error"}), 500
+        print(f"Error in get_client_me: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Internal Error"}), 500
 
 @app.route('/api/client/activate-trial', methods=['POST'])
 def activate_trial():
@@ -415,6 +1249,123 @@ def get_all_users(current_admin):
         return jsonify(combined), 200
     except Exception as e: 
         print(e); return jsonify({"message": "Internal Error"}), 500
+
+@app.route('/api/admin/sync-bot-users', methods=['POST'])
+@admin_required
+def sync_bot_users(current_admin):
+    """
+    Синхронизация пользователей из Telegram бота в веб-панель.
+    Получает всех пользователей из бота и создает/обновляет их в веб-панели.
+    """
+    if not BOT_API_URL or not BOT_API_TOKEN:
+        return jsonify({"message": "Bot API not configured"}), 500
+    
+    try:
+        # Получаем всех пользователей из бота
+        bot_resp = requests.get(
+            f"{BOT_API_URL}/users",
+            headers={"X-API-Key": BOT_API_TOKEN},
+            params={"limit": 1000},  # Получаем до 1000 пользователей
+            timeout=30
+        )
+        
+        if bot_resp.status_code != 200:
+            return jsonify({"message": f"Bot API error: {bot_resp.status_code}"}), 500
+        
+        bot_data = bot_resp.json()
+        bot_users = []
+        
+        # Парсим ответ в зависимости от формата
+        if isinstance(bot_data, dict):
+            if 'items' in bot_data:
+                bot_users = bot_data['items']
+            elif 'response' in bot_data:
+                if isinstance(bot_data['response'], list):
+                    bot_users = bot_data['response']
+                elif isinstance(bot_data['response'], dict) and 'items' in bot_data['response']:
+                    bot_users = bot_data['response']['items']
+        elif isinstance(bot_data, list):
+            bot_users = bot_data
+        
+        if not bot_users:
+            return jsonify({"message": "No users found in bot", "synced": 0, "created": 0, "updated": 0}), 200
+        
+        sys_settings = SystemSetting.query.first() or SystemSetting(id=1)
+        if not sys_settings.id:
+            db.session.add(sys_settings)
+            db.session.flush()
+        
+        synced = 0
+        created = 0
+        updated = 0
+        
+        for bot_user in bot_users:
+            telegram_id = bot_user.get('telegram_id')
+            remnawave_uuid = bot_user.get('remnawave_uuid') or bot_user.get('uuid')
+            
+            if not remnawave_uuid:
+                continue  # Пропускаем пользователей без remnawave_uuid
+            
+            # Ищем пользователя по telegram_id или remnawave_uuid
+            user = None
+            if telegram_id:
+                user = User.query.filter_by(telegram_id=telegram_id).first()
+            
+            if not user:
+                user = User.query.filter_by(remnawave_uuid=remnawave_uuid).first()
+            
+            telegram_username = bot_user.get('username') or bot_user.get('telegram_username')
+            first_name = bot_user.get('first_name', '')
+            last_name = bot_user.get('last_name', '')
+            
+            if user:
+                # Обновляем существующего пользователя
+                if telegram_id and not user.telegram_id:
+                    user.telegram_id = telegram_id
+                if telegram_username and user.telegram_username != telegram_username:
+                    user.telegram_username = telegram_username
+                if not user.email:
+                    user.email = f"tg_{telegram_id}@telegram.local" if telegram_id else f"user_{user.id}@telegram.local"
+                if not user.is_verified and telegram_id:
+                    user.is_verified = True  # Telegram пользователи считаются верифицированными
+                updated += 1
+            else:
+                # Создаем нового пользователя
+                user = User(
+                    telegram_id=telegram_id,
+                    telegram_username=telegram_username,
+                    email=f"tg_{telegram_id}@telegram.local" if telegram_id else f"user_{remnawave_uuid[:8]}@telegram.local",
+                    password_hash=None,
+                    remnawave_uuid=remnawave_uuid,
+                    is_verified=True if telegram_id else False,
+                    preferred_lang=sys_settings.default_language,
+                    preferred_currency=sys_settings.default_currency
+                )
+                db.session.add(user)
+                db.session.flush()
+                user.referral_code = generate_referral_code(user.id)
+                created += 1
+            
+            synced += 1
+        
+        db.session.commit()
+        
+        return jsonify({
+            "message": "Sync completed",
+            "synced": synced,
+            "created": created,
+            "updated": updated
+        }), 200
+        
+    except requests.RequestException as e:
+        print(f"Bot API Error: {e}")
+        return jsonify({"message": f"Cannot connect to bot API: {str(e)}"}), 500
+    except Exception as e:
+        print(f"Sync Error: {e}")
+        import traceback
+        traceback.print_exc()
+        db.session.rollback()
+        return jsonify({"message": f"Internal Server Error: {str(e)}"}), 500
 
 @app.route('/api/admin/users/<int:user_id>', methods=['DELETE'])
 @admin_required
@@ -1115,6 +2066,20 @@ def crystal_webhook():
     db.session.commit()
     cache.delete(f'live_data_{u.remnawave_uuid}')
     cache.delete(f'nodes_{u.remnawave_uuid}')  # Очищаем кэш серверов при изменении сквада
+    
+    # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+    # Это не блокирует ответ вебхука, так как синхронизация может занимать много времени
+    if BOT_API_URL and BOT_API_TOKEN:
+        app_context = app.app_context()
+        import threading
+        sync_thread = threading.Thread(
+            target=sync_subscription_to_bot_in_background,
+            args=(app_context, u.remnawave_uuid),
+            daemon=True
+        )
+        sync_thread.start()
+        print(f"Started background sync thread for user {u.remnawave_uuid}")
+    
     return jsonify({"error": False}), 200
 
 @app.route('/api/webhook/heleket', methods=['POST'])
@@ -1160,7 +2125,10 @@ def heleket_webhook():
         patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
         patch_payload["trafficLimitStrategy"] = "NO_RESET"
     
-    requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+    patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+    if not patch_resp.ok:
+        print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+        return jsonify({"error": False}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
     
     # Списываем использование промокода, если он был использован
     if p.promo_code_id:
@@ -1172,6 +2140,59 @@ def heleket_webhook():
     db.session.commit()
     cache.delete(f'live_data_{u.remnawave_uuid}')
     cache.delete(f'nodes_{u.remnawave_uuid}')  # Очищаем кэш серверов при изменении сквада
+    
+    # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+    # Это не блокирует ответ вебхука, так как синхронизация может занимать много времени
+    if BOT_API_URL and BOT_API_TOKEN:
+        app_context = app.app_context()
+        import threading
+        sync_thread = threading.Thread(
+            target=sync_subscription_to_bot_in_background,
+            args=(app_context, u.remnawave_uuid),
+            daemon=True
+        )
+        sync_thread.start()
+        print(f"Started background sync thread for user {u.remnawave_uuid}")
+        try:
+            bot_api_url = BOT_API_URL.rstrip('/')
+            # Обновляем подписку пользователя в боте, передавая новые данные из RemnaWave
+            update_url = f"{bot_api_url}/users/{u.telegram_id}"
+            update_headers = {"X-API-Key": BOT_API_TOKEN, "Content-Type": "application/json"}
+            
+            # Получаем актуальные данные из RemnaWave для передачи в бот
+            live_after_update = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h, timeout=5)
+            if live_after_update.ok:
+                live_data = live_after_update.json().get('response', {})
+                # Формируем payload для обновления в боте
+                bot_update_payload = {
+                    "remnawave_uuid": u.remnawave_uuid,
+                    "expire_at": live_data.get('expireAt'),
+                    "subscription": {
+                        "url": live_data.get('subscription_url', ''),
+                        "expire_at": live_data.get('expireAt')
+                    }
+                }
+                
+                print(f"Updating user subscription in bot for telegram_id {u.telegram_id}...")
+                bot_update_response = requests.patch(update_url, headers=update_headers, json=bot_update_payload, timeout=10)
+                if bot_update_response.status_code == 200:
+                    print(f"✓ User subscription updated in bot for telegram_id {u.telegram_id}")
+                elif bot_update_response.status_code == 404:
+                    print(f"⚠️ User with telegram_id {u.telegram_id} not found in bot, skipping update")
+                else:
+                    print(f"⚠️ Failed to update user in bot: Status {bot_update_response.status_code}")
+                    print(f"   Response: {bot_update_response.text[:200]}")
+            else:
+                print(f"⚠️ Failed to get updated user data from RemnaWave for bot sync")
+        except Exception as e:
+            print(f"⚠️ Error updating user subscription in bot: {e}")
+            import traceback
+            traceback.print_exc()
+    elif BOT_API_URL and BOT_API_TOKEN and not u.telegram_id:
+        print(f"⚠️ User {u.remnawave_uuid} has no telegram_id, cannot sync to bot")
+    else:
+        print(f"⚠️ Bot API not configured (BOT_API_URL or BOT_API_TOKEN missing), skipping sync")
+    
     return jsonify({"error": False}), 200
 
 @app.route('/api/admin/telegram-webhook-status', methods=['GET'])
@@ -1341,7 +2362,10 @@ def telegram_webhook():
                     patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
                     patch_payload["trafficLimitStrategy"] = "NO_RESET"
                 
-                requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+                patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+                if not patch_resp.ok:
+                    print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+                    return jsonify({"ok": True}), 200  # Все равно возвращаем успех
                 
                 # Списываем использование промокода, если он был использован
                 if p.promo_code_id:
@@ -1353,6 +2377,19 @@ def telegram_webhook():
                 db.session.commit()
                 cache.delete(f'live_data_{u.remnawave_uuid}')
                 cache.delete(f'nodes_{u.remnawave_uuid}')
+                
+                # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+                # Это не блокирует ответ вебхука, так как синхронизация может занимать много времени
+                if BOT_API_URL and BOT_API_TOKEN:
+                    app_context = app.app_context()
+                    import threading
+                    sync_thread = threading.Thread(
+                        target=sync_subscription_to_bot_in_background,
+                        args=(app_context, u.remnawave_uuid),
+                        daemon=True
+                    )
+                    sync_thread.start()
+                    print(f"Started background sync thread for user {u.remnawave_uuid}")
         
         return jsonify({"ok": True}), 200
     except Exception as e:
