@@ -499,19 +499,12 @@ const TariffSection = () => {
               >
                 {loadingTariffId === selectedTariffId ? 'Создаем счёт…' : 'Heleket (Криптовалюты)'}
               </button>
-              <button
-                className="btn btn-primary"
-                onClick={() => handleCreatePayment('platega', Array.isArray(plategaMethods) && plategaMethods.length > 0 ? plategaMethods[0] : null)}
-                disabled={loadingTariffId === selectedTariffId}
-              >
-                {loadingTariffId === selectedTariffId ? 'Создаем счёт…' : 'Platega'}
-              </button>
-              {Array.isArray(plategaMethods) && plategaMethods.length > 0 && (
-                <div className="platega-methods-list">
+              {Array.isArray(plategaMethods) && plategaMethods.length > 0 ? (
+                <div className="platega-methods-list" style={{ width: '100%', display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   {plategaMethods.map((m) => (
                     <button
                       key={`platega-${m}`}
-                      className="btn btn-secondary"
+                      className="btn btn-primary"
                       onClick={() => handleCreatePayment('platega', m)}
                       disabled={loadingTariffId === selectedTariffId}
                       style={{ width: '100%' }}
@@ -520,6 +513,14 @@ const TariffSection = () => {
                     </button>
                   ))}
                 </div>
+              ) : (
+                <button
+                  className="btn btn-primary"
+                  onClick={() => handleCreatePayment('platega')}
+                  disabled={loadingTariffId === selectedTariffId}
+                >
+                  {loadingTariffId === selectedTariffId ? 'Создаем счёт…' : 'Platega'}
+                </button>
               )}
               <div style={{ width: '100%' }}>
                 <button
