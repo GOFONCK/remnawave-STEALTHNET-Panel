@@ -4,7 +4,7 @@
 
 ![stealthnet](https://github.com/user-attachments/assets/7206748f-2627-4035-9377-3ea65ddaf14f)
 
-## 🧪 [Тестирование Сайта](https://panel.stealthnet.app/login)  ## 💬 **[STEALTHNET Chat](https://t.me/stealthnet_admin_panel)** - Для общения, вопросов, предложений
+## 🧪 [Тестовый Сайт](https://panel.stealthnet.app/login)         ##   ##  ##       💬 **[STEALTHNET Chat](https://t.me/stealthnet_admin_panel)** - Для общения и вопросов !
 
 
 
@@ -521,6 +521,7 @@ STEALTHNET-Admin-Panel/
 ---
 
 **StealthNET VPN** — Ваша свобода в цифровом мире 🛡️
+
 
 
 
