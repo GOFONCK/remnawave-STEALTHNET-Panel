@@ -113,7 +113,7 @@ class PromoCode(db.Model):
 class ReferralSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     invitee_bonus_days = db.Column(db.Integer, default=7)
-    referrer_bonus_days = db.Column(db.Integer, default=7)
+    referrer_bonus_days = db.Column(db.Integer, default=7) 
     trial_squad_id = db.Column(db.String(255), nullable=True)  # Сквад для триальной подписки
 
 class TariffFeatureSetting(db.Model):
@@ -148,6 +148,14 @@ class PaymentSetting(db.Model):
     yookassa_shop_id = db.Column(db.Text, nullable=True)  # Идентификатор магазина YooKassa
     yookassa_secret_key = db.Column(db.Text, nullable=True)  # Секретный ключ YooKassa
     cryptobot_api_key = db.Column(db.Text, nullable=True)
+    platega_api_key = db.Column(db.Text, nullable=True)  # API ключ Platega
+    platega_merchant_id = db.Column(db.Text, nullable=True)  # Merchant ID Platega
+    mulenpay_api_key = db.Column(db.Text, nullable=True)  # API ключ Mulenpay
+    mulenpay_secret_key = db.Column(db.Text, nullable=True)  # Secret ключ Mulenpay
+    mulenpay_shop_id = db.Column(db.Text, nullable=True)  # Shop ID Mulenpay
+    urlpay_api_key = db.Column(db.Text, nullable=True)  # API ключ UrlPay
+    urlpay_secret_key = db.Column(db.Text, nullable=True)  # Secret ключ UrlPay
+    urlpay_shop_id = db.Column(db.Text, nullable=True)  # Shop ID UrlPay
 
 class SystemSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -177,7 +185,7 @@ class Payment(db.Model):
     amount = db.Column(db.Float, nullable=False)
     currency = db.Column(db.String(5), nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
-    payment_system_id = db.Column(db.String(100), nullable=True)
+    payment_system_id = db.Column(db.String(100), nullable=True) 
     payment_provider = db.Column(db.String(20), nullable=True, default='crystalpay')  # 'crystalpay', 'heleket', 'yookassa', 'telegram_stars'
     promo_code_id = db.Column(db.Integer, db.ForeignKey('promo_code.id'), nullable=True)  # Промокод, использованный при оплате 
 
@@ -293,11 +301,6 @@ def send_email_in_background(app_context, recipient, subject, html_body):
 # ----------------------------------------------------
 # ЭНДПОИНТЫ
 # ----------------------------------------------------
-
-@app.route('/api/public/health', methods=['GET'])
-def health_check():
-    """Health check endpoint для Docker и мониторинга"""
-    return jsonify({"status": "healthy", "service": "stealthnet-api"}), 200
 
 @app.route('/api/public/register', methods=['POST'])
 @limiter.limit("5 per hour") 
@@ -1450,6 +1453,144 @@ def get_squads(current_admin):
     except Exception as e:
         return jsonify({"error": "Internal error", "message": str(e)}), 500
 
+# --- NODES (Ноды) ---
+@app.route('/api/admin/nodes', methods=['GET'])
+@admin_required
+def get_nodes(current_admin):
+    """Получить список всех нод из внешнего API"""
+    try:
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        resp = requests.get(f"{API_URL}/api/nodes", headers=headers, timeout=10)
+        resp.raise_for_status()
+        
+        data = resp.json()
+        
+        # Обрабатываем ответ согласно структуре API
+        if isinstance(data, dict) and 'response' in data:
+            nodes_list = data['response']
+            if isinstance(nodes_list, dict) and 'nodes' in nodes_list:
+                nodes_list = nodes_list['nodes']
+            elif not isinstance(nodes_list, list):
+                nodes_list = []
+        elif isinstance(data, list):
+            nodes_list = data
+        else:
+            nodes_list = []
+        
+        # Логируем структуру для отладки (только первые несколько символов)
+        if nodes_list and len(nodes_list) > 0:
+            print(f"[NODES DEBUG] Получено {len(nodes_list)} нод")
+            print(f"[NODES DEBUG] Первая нода (первые поля): {list(nodes_list[0].keys())[:10] if isinstance(nodes_list[0], dict) else 'not a dict'}")
+            if isinstance(nodes_list[0], dict):
+                sample_node = nodes_list[0]
+                print(f"[NODES DEBUG] Пример полей: status={sample_node.get('status')}, isOnline={sample_node.get('isOnline')}, isActive={sample_node.get('isActive')}, state={sample_node.get('state')}")
+        
+        # Кэшируем на 2 минуты (ноды могут часто меняться)
+        cache.set('nodes_list', nodes_list, timeout=120)
+        return jsonify(nodes_list), 200
+    except requests.exceptions.RequestException as e:
+        cached = cache.get('nodes_list')
+        if cached:
+            return jsonify(cached), 200
+        return jsonify({"error": "Failed to fetch nodes", "message": str(e)}), 500
+    except Exception as e:
+        print(f"[NODES ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Internal error", "message": str(e)}), 500
+
+@app.route('/api/admin/nodes/<uuid>/restart', methods=['POST'])
+@admin_required
+def restart_node(current_admin, uuid):
+    """Перезапустить конкретную ноду"""
+    try:
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        resp = requests.post(
+            f"{API_URL}/api/nodes/{uuid}/actions/restart",
+            headers=headers,
+            timeout=30
+        )
+        resp.raise_for_status()
+        
+        # Очищаем кэш нод после перезапуска
+        cache.delete('nodes_list')
+        
+        data = resp.json()
+        return jsonify({"message": "Node restart initiated", "response": data}), 200
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": "Failed to restart node", "message": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": "Internal error", "message": str(e)}), 500
+
+@app.route('/api/admin/nodes/restart-all', methods=['POST'])
+@admin_required
+def restart_all_nodes(current_admin):
+    """Перезапустить все ноды"""
+    try:
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        resp = requests.post(
+            f"{API_URL}/api/nodes/actions/restart-all",
+            headers=headers,
+            timeout=60
+        )
+        resp.raise_for_status()
+        
+        # Очищаем кэш нод после перезапуска
+        cache.delete('nodes_list')
+        
+        data = resp.json()
+        return jsonify({"message": "All nodes restart initiated", "response": data}), 200
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": "Failed to restart all nodes", "message": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": "Internal error", "message": str(e)}), 500
+
+@app.route('/api/admin/nodes/<uuid>/enable', methods=['POST'])
+@admin_required
+def enable_node(current_admin, uuid):
+    """Включить конкретную ноду"""
+    try:
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        resp = requests.post(
+            f"{API_URL}/api/nodes/{uuid}/actions/enable",
+            headers=headers,
+            timeout=30
+        )
+        resp.raise_for_status()
+        
+        # Очищаем кэш нод после изменения
+        cache.delete('nodes_list')
+        
+        data = resp.json()
+        return jsonify({"message": "Node enabled", "response": data}), 200
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": "Failed to enable node", "message": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": "Internal error", "message": str(e)}), 500
+
+@app.route('/api/admin/nodes/<uuid>/disable', methods=['POST'])
+@admin_required
+def disable_node(current_admin, uuid):
+    """Отключить конкретную ноду"""
+    try:
+        headers = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        resp = requests.post(
+            f"{API_URL}/api/nodes/{uuid}/actions/disable",
+            headers=headers,
+            timeout=30
+        )
+        resp.raise_for_status()
+        
+        # Очищаем кэш нод после изменения
+        cache.delete('nodes_list')
+        
+        data = resp.json()
+        return jsonify({"message": "Node disabled", "response": data}), 200
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": "Failed to disable node", "message": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": "Internal error", "message": str(e)}), 500
+
 # --- TARIFFS ---
 @app.route('/api/admin/tariffs', methods=['GET'])
 @admin_required
@@ -1955,6 +2096,62 @@ def public_branding():
 
 # --- PAYMENT & SUPPORT ---
 
+@app.route('/api/public/available-payment-methods', methods=['GET'])
+def available_payment_methods():
+    """
+    Возвращает список доступных способов оплаты (те, у которых настроены ключи).
+    Публичный endpoint, доступен без авторизации.
+    """
+    s = PaymentSetting.query.first()
+    if not s:
+        return jsonify({"available_methods": []}), 200
+    
+    available = []
+    
+    # CrystalPay - нужны api_key и api_secret
+    crystalpay_key = decrypt_key(s.crystalpay_api_key) if s.crystalpay_api_key else None
+    crystalpay_secret = decrypt_key(s.crystalpay_api_secret) if s.crystalpay_api_secret else None
+    if crystalpay_key and crystalpay_secret and crystalpay_key != "DECRYPTION_ERROR" and crystalpay_secret != "DECRYPTION_ERROR":
+        available.append('crystalpay')
+    
+    # Heleket - нужен api_key
+    heleket_key = decrypt_key(s.heleket_api_key) if s.heleket_api_key else None
+    if heleket_key and heleket_key != "DECRYPTION_ERROR":
+        available.append('heleket')
+    
+    # YooKassa - нужны shop_id и secret_key
+    yookassa_shop = decrypt_key(s.yookassa_shop_id) if s.yookassa_shop_id else None
+    yookassa_secret = decrypt_key(s.yookassa_secret_key) if s.yookassa_secret_key else None
+    if yookassa_shop and yookassa_secret and yookassa_shop != "DECRYPTION_ERROR" and yookassa_secret != "DECRYPTION_ERROR":
+        available.append('yookassa')
+    
+    # Platega - нужны api_key и merchant_id
+    platega_key = decrypt_key(s.platega_api_key) if s.platega_api_key else None
+    platega_merchant = decrypt_key(s.platega_merchant_id) if s.platega_merchant_id else None
+    if platega_key and platega_merchant and platega_key != "DECRYPTION_ERROR" and platega_merchant != "DECRYPTION_ERROR":
+        available.append('platega')
+    
+    # Mulenpay - нужны api_key, secret_key и shop_id
+    mulenpay_key = decrypt_key(s.mulenpay_api_key) if s.mulenpay_api_key else None
+    mulenpay_secret = decrypt_key(s.mulenpay_secret_key) if s.mulenpay_secret_key else None
+    mulenpay_shop = decrypt_key(s.mulenpay_shop_id) if s.mulenpay_shop_id else None
+    if mulenpay_key and mulenpay_secret and mulenpay_shop and mulenpay_key != "DECRYPTION_ERROR" and mulenpay_secret != "DECRYPTION_ERROR" and mulenpay_shop != "DECRYPTION_ERROR":
+        available.append('mulenpay')
+    
+    # UrlPay - нужны api_key, secret_key и shop_id
+    urlpay_key = decrypt_key(s.urlpay_api_key) if s.urlpay_api_key else None
+    urlpay_secret = decrypt_key(s.urlpay_secret_key) if s.urlpay_secret_key else None
+    urlpay_shop = decrypt_key(s.urlpay_shop_id) if s.urlpay_shop_id else None
+    if urlpay_key and urlpay_secret and urlpay_shop and urlpay_key != "DECRYPTION_ERROR" and urlpay_secret != "DECRYPTION_ERROR" and urlpay_shop != "DECRYPTION_ERROR":
+        available.append('urlpay')
+    
+    # Telegram Stars - нужен bot_token
+    telegram_token = decrypt_key(s.telegram_bot_token) if s.telegram_bot_token else None
+    if telegram_token and telegram_token != "DECRYPTION_ERROR":
+        available.append('telegram_stars')
+    
+    return jsonify({"available_methods": available}), 200
+
 @app.route('/api/admin/payment-settings', methods=['GET', 'POST'])
 @admin_required
 def pay_settings(current_admin):
@@ -1968,6 +2165,14 @@ def pay_settings(current_admin):
         s.telegram_bot_token = encrypt_key(d.get('telegram_bot_token', ''))
         s.yookassa_shop_id = encrypt_key(d.get('yookassa_shop_id', ''))
         s.yookassa_secret_key = encrypt_key(d.get('yookassa_secret_key', ''))
+        s.platega_api_key = encrypt_key(d.get('platega_api_key', ''))
+        s.platega_merchant_id = encrypt_key(d.get('platega_merchant_id', ''))
+        s.mulenpay_api_key = encrypt_key(d.get('mulenpay_api_key', ''))
+        s.mulenpay_secret_key = encrypt_key(d.get('mulenpay_secret_key', ''))
+        s.mulenpay_shop_id = encrypt_key(d.get('mulenpay_shop_id', ''))
+        s.urlpay_api_key = encrypt_key(d.get('urlpay_api_key', ''))
+        s.urlpay_secret_key = encrypt_key(d.get('urlpay_secret_key', ''))
+        s.urlpay_shop_id = encrypt_key(d.get('urlpay_shop_id', ''))
         db.session.commit()
     return jsonify({
         "crystalpay_api_key": decrypt_key(s.crystalpay_api_key), 
@@ -1975,7 +2180,15 @@ def pay_settings(current_admin):
         "heleket_api_key": decrypt_key(s.heleket_api_key),
         "telegram_bot_token": decrypt_key(s.telegram_bot_token),
         "yookassa_shop_id": decrypt_key(s.yookassa_shop_id),
-        "yookassa_secret_key": decrypt_key(s.yookassa_secret_key)
+        "yookassa_secret_key": decrypt_key(s.yookassa_secret_key),
+        "platega_api_key": decrypt_key(s.platega_api_key),
+        "platega_merchant_id": decrypt_key(s.platega_merchant_id),
+        "mulenpay_api_key": decrypt_key(s.mulenpay_api_key),
+        "mulenpay_secret_key": decrypt_key(s.mulenpay_secret_key),
+        "mulenpay_shop_id": decrypt_key(s.mulenpay_shop_id),
+        "urlpay_api_key": decrypt_key(s.urlpay_api_key),
+        "urlpay_secret_key": decrypt_key(s.urlpay_secret_key),
+        "urlpay_shop_id": decrypt_key(s.urlpay_shop_id)
     }), 200
 
 @app.route('/api/client/create-payment', methods=['POST'])
@@ -2205,6 +2418,218 @@ def create_payment():
                     error_msg = str(e)
                 return jsonify({"message": f"YooKassa API Error: {error_msg}"}), 500
         
+        elif payment_provider == 'platega':
+            # Platega API
+            import uuid
+            api_key = decrypt_key(s.platega_api_key)
+            merchant_id = decrypt_key(s.platega_merchant_id)
+            
+            if not api_key or not merchant_id or api_key == "DECRYPTION_ERROR" or merchant_id == "DECRYPTION_ERROR":
+                return jsonify({"message": "Platega credentials not configured"}), 500
+            
+            # Генерируем UUID для транзакции
+            transaction_uuid = str(uuid.uuid4())
+            
+            # Формируем payload для создания платежа
+            # Сначала нужно получить доступные методы оплаты, но для простоты используем paymentMethod = 1
+            # В реальности нужно получить список методов через GET /api/platega.io/transaction/payment_methods
+            payload = {
+                "merchantId": merchant_id,
+                "paymentMethod": 1,  # По умолчанию используем метод 1, можно сделать получение списка методов
+                "paymentDetails": {
+                    "amount": final_amount,
+                    "currency": info['c']
+                },
+                "id": transaction_uuid
+            }
+            
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://api.platega.io/transaction/process",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                payment_url = payment_data.get('redirect')
+                payment_system_id = payment_data.get('transactionId') or transaction_uuid
+                
+                if not payment_url:
+                    error_msg = payment_data.get('message', 'Failed to get payment URL from Platega')
+                    print(f"Platega Error: {error_msg}")
+                    return jsonify({"message": error_msg}), 500
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"Platega API Error: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message', str(e))
+                    except:
+                        error_msg = str(e)
+                else:
+                    error_msg = str(e)
+                return jsonify({"message": f"Platega API Error: {error_msg}"}), 500
+        
+        elif payment_provider == 'mulenpay':
+            # Mulenpay API
+            api_key = decrypt_key(s.mulenpay_api_key)
+            secret_key = decrypt_key(s.mulenpay_secret_key)
+            shop_id = decrypt_key(s.mulenpay_shop_id)
+            
+            if not api_key or not secret_key or not shop_id or api_key == "DECRYPTION_ERROR" or secret_key == "DECRYPTION_ERROR" or shop_id == "DECRYPTION_ERROR":
+                return jsonify({"message": "Mulenpay credentials not configured"}), 500
+            
+            # Конвертируем валюту в формат Mulenpay (rub, uah, usd)
+            currency_map = {
+                'RUB': 'rub',
+                'UAH': 'uah',
+                'USD': 'usd'
+            }
+            mulenpay_currency = currency_map.get(info['c'], info['c'].lower())
+            
+            # Формируем payload для создания платежа
+            # shopId может быть числом или строкой, пробуем преобразовать в int если возможно
+            try:
+                shop_id_int = int(shop_id)
+            except (ValueError, TypeError):
+                shop_id_int = shop_id
+            
+            payload = {
+                "currency": mulenpay_currency,
+                "amount": str(final_amount),
+                "uuid": order_id,
+                "shopId": shop_id_int,
+                "description": f"Подписка StealthNET - {t.name} ({t.duration_days} дней)",
+                "subscribe": None,
+                "holdTime": None
+            }
+            
+            # Mulenpay использует Basic Auth с api_key:secret_key
+            import base64
+            auth_string = f"{api_key}:{secret_key}"
+            auth_bytes = auth_string.encode('ascii')
+            auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+            
+            headers = {
+                "Authorization": f"Basic {auth_b64}",
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://api.mulenpay.ru/v2/payments",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                # Mulenpay возвращает URL для оплаты в поле "url" или "payment_url"
+                payment_url = payment_data.get('url') or payment_data.get('payment_url') or payment_data.get('redirect')
+                payment_system_id = payment_data.get('id') or payment_data.get('payment_id') or order_id
+                
+                if not payment_url:
+                    error_msg = payment_data.get('message') or payment_data.get('error') or 'Failed to get payment URL from Mulenpay'
+                    print(f"Mulenpay Error: {error_msg}")
+                    return jsonify({"message": error_msg}), 500
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"Mulenpay API Error: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                    except:
+                        error_msg = str(e)
+                else:
+                    error_msg = str(e)
+                return jsonify({"message": f"Mulenpay API Error: {error_msg}"}), 500
+        
+        elif payment_provider == 'urlpay':
+            # UrlPay API (аналогично Mulenpay)
+            api_key = decrypt_key(s.urlpay_api_key)
+            secret_key = decrypt_key(s.urlpay_secret_key)
+            shop_id = decrypt_key(s.urlpay_shop_id)
+            
+            if not api_key or not secret_key or not shop_id or api_key == "DECRYPTION_ERROR" or secret_key == "DECRYPTION_ERROR" or shop_id == "DECRYPTION_ERROR":
+                return jsonify({"message": "UrlPay credentials not configured"}), 500
+            
+            # Конвертируем валюту в формат UrlPay (rub, uah, usd)
+            currency_map = {
+                'RUB': 'rub',
+                'UAH': 'uah',
+                'USD': 'usd'
+            }
+            urlpay_currency = currency_map.get(info['c'], info['c'].lower())
+            
+            # Формируем payload для создания платежа
+            # shopId может быть числом или строкой, пробуем преобразовать в int если возможно
+            try:
+                shop_id_int = int(shop_id)
+            except (ValueError, TypeError):
+                shop_id_int = shop_id
+            
+            payload = {
+                "currency": urlpay_currency,
+                "amount": str(final_amount),
+                "uuid": order_id,
+                "shopId": shop_id_int,
+                "description": f"Подписка StealthNET - {t.name} ({t.duration_days} дней)",
+                "subscribe": None,
+                "holdTime": None
+            }
+            
+            # UrlPay использует Basic Auth с api_key:secret_key
+            import base64
+            auth_string = f"{api_key}:{secret_key}"
+            auth_bytes = auth_string.encode('ascii')
+            auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+            
+            headers = {
+                "Authorization": f"Basic {auth_b64}",
+                "Content-Type": "application/json"
+            }
+            
+            try:
+                resp = requests.post(
+                    "https://api.urlpay.io/v2/payments",
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                payment_data = resp.json()
+                
+                # UrlPay возвращает URL для оплаты в поле "url" или "payment_url"
+                payment_url = payment_data.get('url') or payment_data.get('payment_url') or payment_data.get('redirect')
+                payment_system_id = payment_data.get('id') or payment_data.get('payment_id') or order_id
+                
+                if not payment_url:
+                    error_msg = payment_data.get('message') or payment_data.get('error') or 'Failed to get payment URL from UrlPay'
+                    print(f"UrlPay Error: {error_msg}")
+                    return jsonify({"message": error_msg}), 500
+                    
+            except requests.exceptions.RequestException as e:
+                print(f"UrlPay API Error: {e}")
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                    except:
+                        error_msg = str(e)
+                else:
+                    error_msg = str(e)
+                return jsonify({"message": f"UrlPay API Error: {error_msg}"}), 500
+        
         else:
             # CrystalPay API (по умолчанию)
             login = decrypt_key(s.crystalpay_api_key)
@@ -2276,7 +2701,10 @@ def crystal_webhook():
         patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
         patch_payload["trafficLimitStrategy"] = "NO_RESET"
     
-    requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+    patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+    if not patch_resp.ok:
+        print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+        return jsonify({"error": False}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
     
     # Списываем использование промокода, если он был использован
     if p.promo_code_id:
@@ -2547,7 +2975,10 @@ def yookassa_webhook():
                 patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
                 patch_payload["trafficLimitStrategy"] = "NO_RESET"
             
-            requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+            patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+            if not patch_resp.ok:
+                print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+                return jsonify({"error": False}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
             
             # Списываем использование промокода, если он был использован
             if p.promo_code_id:
@@ -2714,6 +3145,290 @@ def telegram_webhook():
         print(f"Telegram webhook error: {e}")
         return jsonify({"ok": True}), 200  # Всегда возвращаем успех, чтобы Telegram не повторял запрос
 
+@app.route('/api/webhook/platega', methods=['POST'])
+def platega_webhook():
+    """Webhook для обработки уведомлений от Platega"""
+    try:
+        webhook_data = request.json
+        
+        # Проверяем статус платежа
+        status = webhook_data.get('status', '').lower()
+        transaction = webhook_data.get('transaction', {})
+        
+        # Нас интересуют только успешные платежи
+        if status not in ['paid', 'success', 'completed']:
+            return jsonify({}), 200
+        
+        # Получаем ID транзакции из webhook
+        transaction_id = transaction.get('id')
+        invoice_id = transaction.get('invoiceId')
+        
+        # Ищем платеж по transaction_id или invoice_id
+        p = None
+        if transaction_id:
+            p = Payment.query.filter_by(payment_system_id=transaction_id).first()
+        if not p and invoice_id:
+            p = Payment.query.filter_by(order_id=invoice_id).first()
+        
+        if not p:
+            print(f"Platega webhook: Payment not found for transaction_id={transaction_id}, invoice_id={invoice_id}")
+            return jsonify({}), 200
+        
+        # Если платеж уже обработан, игнорируем
+        if p.status == 'PAID':
+            return jsonify({}), 200
+        
+        u = db.session.get(User, p.user_id)
+        t = db.session.get(Tariff, p.tariff_id)
+        
+        if not u or not t:
+            print(f"Platega webhook: User or Tariff not found for payment {p.order_id}")
+            return jsonify({}), 200
+        
+        h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
+        curr_exp = datetime.fromisoformat(live.get('expireAt'))
+        new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
+        
+        # Используем сквад из тарифа, если указан, иначе дефолтный
+        squad_id = t.squad_id if t.squad_id else DEFAULT_SQUAD_ID
+        
+        # Формируем payload для обновления пользователя
+        patch_payload = {
+            "uuid": u.remnawave_uuid,
+            "expireAt": new_exp.isoformat(),
+            "activeInternalSquads": [squad_id]
+        }
+        
+        # Добавляем лимит трафика, если указан в тарифе
+        if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
+            patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
+            patch_payload["trafficLimitStrategy"] = "NO_RESET"
+        
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+        if not patch_resp.ok:
+            print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+            return jsonify({}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
+        
+        # Списываем использование промокода, если он был использован
+        if p.promo_code_id:
+            promo = db.session.get(PromoCode, p.promo_code_id)
+            if promo and promo.uses_left > 0:
+                promo.uses_left -= 1
+        
+        p.status = 'PAID'
+        db.session.commit()
+        cache.delete(f'live_data_{u.remnawave_uuid}')
+        cache.delete(f'nodes_{u.remnawave_uuid}')
+        
+        # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+        if BOT_API_URL and BOT_API_TOKEN:
+            app_context = app.app_context()
+            import threading
+            sync_thread = threading.Thread(
+                target=sync_subscription_to_bot_in_background,
+                args=(app_context, u.remnawave_uuid),
+                daemon=True
+            )
+            sync_thread.start()
+            print(f"Started background sync thread for user {u.remnawave_uuid}")
+        
+        return jsonify({}), 200
+        
+    except Exception as e:
+        print(f"Platega webhook error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({}), 200  # Всегда возвращаем 200, чтобы Platega не повторял запрос
+
+@app.route('/api/webhook/mulenpay', methods=['POST'])
+def mulenpay_webhook():
+    """Webhook для обработки уведомлений от Mulenpay"""
+    try:
+        webhook_data = request.json
+        
+        # Mulenpay отправляет данные о платеже
+        # Проверяем статус платежа
+        status = webhook_data.get('status', '').lower()
+        payment_id = webhook_data.get('id') or webhook_data.get('payment_id')
+        uuid = webhook_data.get('uuid')  # Это наш order_id
+        
+        # Нас интересуют только успешные платежи
+        if status not in ['paid', 'success', 'completed', 'successful']:
+            return jsonify({}), 200
+        
+        # Ищем платеж по uuid (order_id) или payment_id
+        p = None
+        if uuid:
+            p = Payment.query.filter_by(order_id=uuid).first()
+        if not p and payment_id:
+            p = Payment.query.filter_by(payment_system_id=str(payment_id)).first()
+        
+        if not p:
+            print(f"Mulenpay webhook: Payment not found for uuid={uuid}, payment_id={payment_id}")
+            return jsonify({}), 200
+        
+        # Если платеж уже обработан, игнорируем
+        if p.status == 'PAID':
+            return jsonify({}), 200
+        
+        u = db.session.get(User, p.user_id)
+        t = db.session.get(Tariff, p.tariff_id)
+        
+        if not u or not t:
+            print(f"Mulenpay webhook: User or Tariff not found for payment {p.order_id}")
+            return jsonify({}), 200
+        
+        h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
+        curr_exp = datetime.fromisoformat(live.get('expireAt'))
+        new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
+        
+        # Используем сквад из тарифа, если указан, иначе дефолтный
+        squad_id = t.squad_id if t.squad_id else DEFAULT_SQUAD_ID
+        
+        # Формируем payload для обновления пользователя
+        patch_payload = {
+            "uuid": u.remnawave_uuid,
+            "expireAt": new_exp.isoformat(),
+            "activeInternalSquads": [squad_id]
+        }
+        
+        # Добавляем лимит трафика, если указан в тарифе
+        if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
+            patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
+            patch_payload["trafficLimitStrategy"] = "NO_RESET"
+        
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+        if not patch_resp.ok:
+            print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+            return jsonify({}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
+        
+        # Списываем использование промокода, если он был использован
+        if p.promo_code_id:
+            promo = db.session.get(PromoCode, p.promo_code_id)
+            if promo and promo.uses_left > 0:
+                promo.uses_left -= 1
+        
+        p.status = 'PAID'
+        db.session.commit()
+        cache.delete(f'live_data_{u.remnawave_uuid}')
+        cache.delete(f'nodes_{u.remnawave_uuid}')
+        
+        # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+        if BOT_API_URL and BOT_API_TOKEN:
+            app_context = app.app_context()
+            import threading
+            sync_thread = threading.Thread(
+                target=sync_subscription_to_bot_in_background,
+                args=(app_context, u.remnawave_uuid),
+                daemon=True
+            )
+            sync_thread.start()
+            print(f"Started background sync thread for user {u.remnawave_uuid}")
+        
+        return jsonify({}), 200
+        
+    except Exception as e:
+        print(f"Mulenpay webhook error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({}), 200  # Всегда возвращаем 200, чтобы Mulenpay не повторял запрос
+
+@app.route('/api/webhook/urlpay', methods=['POST'])
+def urlpay_webhook():
+    """Webhook для обработки уведомлений от UrlPay"""
+    try:
+        webhook_data = request.json
+        
+        # UrlPay отправляет данные о платеже
+        # Проверяем статус платежа
+        status = webhook_data.get('status', '').lower()
+        payment_id = webhook_data.get('id') or webhook_data.get('payment_id')
+        uuid = webhook_data.get('uuid')  # Это наш order_id
+        
+        # Нас интересуют только успешные платежи
+        if status not in ['paid', 'success', 'completed', 'successful']:
+            return jsonify({}), 200
+        
+        # Ищем платеж по uuid (order_id) или payment_id
+        p = None
+        if uuid:
+            p = Payment.query.filter_by(order_id=uuid).first()
+        if not p and payment_id:
+            p = Payment.query.filter_by(payment_system_id=str(payment_id)).first()
+        
+        if not p:
+            print(f"UrlPay webhook: Payment not found for uuid={uuid}, payment_id={payment_id}")
+            return jsonify({}), 200
+        
+        # Если платеж уже обработан, игнорируем
+        if p.status == 'PAID':
+            return jsonify({}), 200
+        
+        u = db.session.get(User, p.user_id)
+        t = db.session.get(Tariff, p.tariff_id)
+        
+        if not u or not t:
+            print(f"UrlPay webhook: User or Tariff not found for payment {p.order_id}")
+            return jsonify({}), 200
+        
+        h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
+        live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
+        curr_exp = datetime.fromisoformat(live.get('expireAt'))
+        new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
+        
+        # Используем сквад из тарифа, если указан, иначе дефолтный
+        squad_id = t.squad_id if t.squad_id else DEFAULT_SQUAD_ID
+        
+        # Формируем payload для обновления пользователя
+        patch_payload = {
+            "uuid": u.remnawave_uuid,
+            "expireAt": new_exp.isoformat(),
+            "activeInternalSquads": [squad_id]
+        }
+        
+        # Добавляем лимит трафика, если указан в тарифе
+        if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
+            patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
+            patch_payload["trafficLimitStrategy"] = "NO_RESET"
+        
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers={"Content-Type": "application/json", **h}, json=patch_payload)
+        if not patch_resp.ok:
+            print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+            return jsonify({}), 200  # Все равно возвращаем успех, чтобы вебхук не повторялся
+        
+        # Списываем использование промокода, если он был использован
+        if p.promo_code_id:
+            promo = db.session.get(PromoCode, p.promo_code_id)
+            if promo and promo.uses_left > 0:
+                promo.uses_left -= 1
+        
+        p.status = 'PAID'
+        db.session.commit()
+        cache.delete(f'live_data_{u.remnawave_uuid}')
+        cache.delete(f'nodes_{u.remnawave_uuid}')
+        
+        # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+        if BOT_API_URL and BOT_API_TOKEN:
+            app_context = app.app_context()
+            import threading
+            sync_thread = threading.Thread(
+                target=sync_subscription_to_bot_in_background,
+                args=(app_context, u.remnawave_uuid),
+                daemon=True
+            )
+            sync_thread.start()
+            print(f"Started background sync thread for user {u.remnawave_uuid}")
+        
+        return jsonify({}), 200
+        
+    except Exception as e:
+        print(f"UrlPay webhook error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({}), 200  # Всегда возвращаем 200, чтобы UrlPay не повторял запрос
+
 @app.route('/api/client/support-tickets', methods=['GET', 'POST'])
 def client_tickets():
     user = get_user_from_token()
@@ -2784,6 +3499,63 @@ def stats(current_admin):
         "total_sales_count": db.session.query(func.count(Payment.id)).filter(Payment.status == 'PAID').scalar(),
         "total_users": db.session.query(func.count(User.id)).scalar()
     }), 200
+
+@app.route('/api/admin/sales', methods=['GET'])
+@admin_required
+def get_sales(current_admin):
+    """Получить список всех продаж с информацией о пользователе и тарифе"""
+    try:
+        limit = request.args.get('limit', type=int) or 50
+        offset = request.args.get('offset', type=int) or 0
+        
+        # Получаем платежи с информацией о пользователе и тарифе
+        payments = db.session.query(
+            Payment,
+            User,
+            Tariff,
+            PromoCode
+        ).join(
+            User, Payment.user_id == User.id
+        ).join(
+            Tariff, Payment.tariff_id == Tariff.id
+        ).outerjoin(
+            PromoCode, Payment.promo_code_id == PromoCode.id
+        ).filter(
+            Payment.status == 'PAID'
+        ).order_by(
+            Payment.created_at.desc()
+        ).limit(limit).offset(offset).all()
+        
+        sales_list = []
+        for payment, user, tariff, promo in payments:
+            sales_list.append({
+                "id": payment.id,
+                "order_id": payment.order_id,
+                "date": payment.created_at.isoformat() if payment.created_at else None,
+                "amount": payment.amount,
+                "currency": payment.currency,
+                "status": payment.status,
+                "payment_provider": payment.payment_provider or 'crystalpay',
+                "user": {
+                    "id": user.id,
+                    "email": user.email,
+                    "telegram_id": user.telegram_id,
+                    "telegram_username": user.telegram_username
+                },
+                "tariff": {
+                    "id": tariff.id,
+                    "name": tariff.name,
+                    "duration_days": tariff.duration_days
+                },
+                "promo_code": promo.code if promo else None
+            })
+        
+        return jsonify(sales_list), 200
+    except Exception as e:
+        print(f"Error getting sales: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Failed to get sales", "message": str(e)}), 500
 
 @app.route('/api/public/verify-email', methods=['POST'])
 @limiter.limit("10 per minute")
@@ -3264,8 +4036,8 @@ def activate_promocode():
 def init_database():
     """
     Инициализирует базу данных при первом запуске.
-    Создает все таблицы и дефолтные настройки.
-    Автоматически проверяет и применяет все миграции.
+    Создает все таблицы и дефолтные настройки, если БД не существует.
+    Для миграции существующих БД используйте скрипт migrate_payment_systems.py
     """
     import os
     import json
@@ -3274,98 +4046,140 @@ def init_database():
     db_path = app.config['SQLALCHEMY_DATABASE_URI'].replace('sqlite:///', '')
     db_exists = os.path.exists(db_path) if db_path else False
     
-    # Проверяем структуру БД, если она существует
-    needs_recreate = False
-    missing_columns = []
+    # Флаг для отслеживания миграции payment_setting
+    payment_migration_performed = False
     
-    if db_exists:
-        try:
-            conn = sqlite3.connect(db_path)
-            cursor = conn.cursor()
-            
-            # Список всех полей из миграций, которые должны быть в БД
-            required_columns = {
-                'user': ['telegram_id', 'telegram_username', 'encrypted_password'],
-                'tariff': ['badge', 'tier', 'traffic_limit_bytes', 'squad_id'],
-                'payment': ['promo_code_id', 'payment_provider', 'payment_system_id'],
-                'payment_setting': ['heleket_api_key', 'telegram_bot_token', 'yookassa_shop_id', 'yookassa_secret_key'],
-                'referral_setting': ['trial_squad_id'],
-            }
-            
-            # Проверяем каждую таблицу
-            for table_name, columns in required_columns.items():
-                cursor.execute(f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}'")
-                if not cursor.fetchone():
-                    # Таблица не существует - будет создана через db.create_all()
-                    continue
-                
-                # Получаем список существующих колонок
-                cursor.execute(f"PRAGMA table_info({table_name})")
-                existing_columns = [col[1] for col in cursor.fetchall()]
-                
-                # Проверяем наличие каждой требуемой колонки
-                for column in columns:
-                    if column not in existing_columns:
-                        missing_columns.append(f"{table_name}.{column}")
-            
-            conn.close()
-            
-            # Если есть недостающие колонки, пересоздаем БД
-            if missing_columns:
-                print(f"⚠️  Обнаружены недостающие колонки в базе данных:")
-                for col in missing_columns:
-                    print(f"   - {col}")
-                print("📦 Пересоздание базы данных с актуальной структурой...")
-                try:
-                    os.remove(db_path)
-                    db_exists = False
-                    needs_recreate = True
-                    print("✓ Старая база данных удалена")
-                except Exception as remove_error:
-                    print(f"❌ Ошибка при удалении старой БД: {remove_error}")
-                    print("   Удалите файл вручную и запустите снова")
-                    return
-            
-            # Также проверяем через ORM запросы (на случай других проблем)
-            try:
-                SystemSetting.query.first()
-                ReferralSetting.query.first()
-                PaymentSetting.query.first()
-                BrandingSetting.query.first()
-                TariffFeatureSetting.query.first()
-            except Exception as e:
-                if 'no such column' in str(e).lower():
-                    if not needs_recreate:
-                        print(f"⚠️  Обнаружена устаревшая структура базы данных: {e}")
-                        print("📦 Пересоздание базы данных с актуальной структурой...")
-                        try:
-                            os.remove(db_path)
-                            db_exists = False
-                            needs_recreate = True
-                            print("✓ Старая база данных удалена")
-                        except Exception as remove_error:
-                            print(f"❌ Ошибка при удалении старой БД: {remove_error}")
-                            print("   Удалите файл вручную и запустите снова")
-                            return
-                else:
-                    # Другая ошибка - просто выводим и продолжаем
-                    print(f"⚠️  Предупреждение при проверке БД: {e}")
-        except Exception as e:
-            print(f"⚠️  Ошибка при проверке структуры БД: {e}")
-            print("   Продолжаем с созданием таблиц...")
+    # Откатываем любые незавершенные транзакции
+    try:
+        db.session.rollback()
+    except:
+        pass
     
-    # Создаем все таблицы
+    # ВСЕГДА создаем все таблицы (если их нет, они будут созданы)
+    # Это гарантирует, что все таблицы существуют перед проверкой записей
     db.create_all()
     
-    # Инициализируем дефолтные настройки только если БД была создана заново или пустая
-    if not db_exists or needs_recreate or not SystemSetting.query.first():
-        if not db_exists or needs_recreate:
-            print("📦 Инициализация новой базы данных...")
-        else:
-            print("📦 Инициализация дефолтных настроек...")
+    # Проверяем, что все необходимые таблицы созданы и имеют все колонки
+    # Если таблиц нет, создаем их явно через raw SQL
+    # Если таблицы есть, но не хватает колонок, добавляем их
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
         
+        # Проверяем наличие ключевых таблиц
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='payment_setting'")
+        payment_table_exists = cursor.fetchone() is not None
+        
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='system_setting'")
+        system_table_exists = cursor.fetchone() is not None
+        
+        # Если таблица payment_setting не существует, создаем её явно
+        if not payment_table_exists:
+            print("⚠️  Таблица payment_setting не найдена, создаем её...")
+            cursor.execute("""
+                CREATE TABLE payment_setting (
+                    id INTEGER PRIMARY KEY,
+                    crystalpay_api_key TEXT,
+                    crystalpay_api_secret TEXT,
+                    heleket_api_key TEXT,
+                    telegram_bot_token TEXT,
+                    yookassa_api_key TEXT,
+                    yookassa_shop_id TEXT,
+                    yookassa_secret_key TEXT,
+                    cryptobot_api_key TEXT,
+                    platega_api_key TEXT,
+                    platega_merchant_id TEXT,
+                    mulenpay_api_key TEXT,
+                    mulenpay_secret_key TEXT,
+                    mulenpay_shop_id TEXT,
+                    urlpay_api_key TEXT,
+                    urlpay_secret_key TEXT,
+                    urlpay_shop_id TEXT
+                )
+            """)
+            conn.commit()
+            print("✓ Таблица payment_setting создана")
+        else:
+            # Таблица существует - проверяем, есть ли все необходимые колонки
+            # Если колонок не хватает, помечаем, что нужно использовать raw SQL
+            # (миграцию колонок выполняет отдельный скрипт migrate_payment_systems.py)
+            cursor.execute("PRAGMA table_info(payment_setting)")
+            existing_columns = [col[1] for col in cursor.fetchall()]
+            
+            # Список всех необходимых колонок
+            required_columns = ['platega_api_key', 'platega_merchant_id', 'mulenpay_api_key', 
+                               'mulenpay_secret_key', 'mulenpay_shop_id', 'urlpay_api_key', 
+                               'urlpay_secret_key', 'urlpay_shop_id']
+            
+            # Проверяем, какие колонки отсутствуют
+            missing_columns = [col for col in required_columns if col not in existing_columns]
+            
+            # Если есть недостающие колонки, используем raw SQL для работы с таблицей
+            # (чтобы избежать ошибок ORM из-за несоответствия схемы)
+            if missing_columns:
+                payment_migration_performed = True
+                print(f"⚠️  В таблице payment_setting отсутствуют {len(missing_columns)} колонок")
+                print("   Для добавления колонок запустите: python3 migrate_payment_systems.py")
+            else:
+                payment_migration_performed = False
+        
+        # Если таблица system_setting не существует, создаем её явно
+        if not system_table_exists:
+            print("⚠️  Таблица system_setting не найдена, создаем её...")
+            cursor.execute("""
+                CREATE TABLE system_setting (
+                    id INTEGER PRIMARY KEY,
+                    default_language VARCHAR(10) NOT NULL DEFAULT 'ru',
+                    default_currency VARCHAR(10) NOT NULL DEFAULT 'uah'
+                )
+            """)
+            conn.commit()
+            print("✓ Таблица system_setting создана")
+        
+        conn.close()
+    except Exception as e:
+        print(f"⚠️  Ошибка при проверке/создании таблиц: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Если БД не существовала, выводим сообщение
+    if not db_exists:
+        print("📦 Создание новой базы данных...")
+        print("✓ Все таблицы созданы")
+        should_init = True
+    else:
+        # БД существует - проверяем, нужно ли инициализировать настройки
+        # Используем ORM, так как таблицы уже должны быть созданы
+        try:
+            system_count = SystemSetting.query.count()
+            payment_count = PaymentSetting.query.count()
+            should_init = (system_count == 0 or payment_count == 0)
+        except Exception as e:
+            # Если ORM не работает, пробуем через raw SQL
+            try:
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM system_setting")
+                system_count = cursor.fetchone()[0]
+                cursor.execute("SELECT COUNT(*) FROM payment_setting")
+                payment_count = cursor.fetchone()[0]
+                conn.close()
+                should_init = (system_count == 0 or payment_count == 0)
+            except Exception as sql_error:
+                print(f"⚠️  Ошибка при проверке БД: {sql_error}")
+                should_init = False
+    
+    if should_init:
+        print("📦 Инициализация дефолтных настроек...")
+    
+    if should_init:
         # 1. SystemSetting
-        if not SystemSetting.query.first():
+        try:
+            system_exists = SystemSetting.query.first() is not None
+        except:
+            system_exists = False
+        
+        if not system_exists:
             system_setting = SystemSetting(
                 id=1,
                 default_language='ru',
@@ -3376,7 +4190,12 @@ def init_database():
             print("✓ SystemSetting инициализирован")
         
         # 2. ReferralSetting
-        if not ReferralSetting.query.first():
+        try:
+            referral_exists = ReferralSetting.query.first() is not None
+        except:
+            referral_exists = False
+        
+        if not referral_exists:
             referral_setting = ReferralSetting(
                 invitee_bonus_days=7,
                 referrer_bonus_days=7,
@@ -3387,14 +4206,94 @@ def init_database():
             print("✓ ReferralSetting инициализирован")
         
         # 3. PaymentSetting
-        if not PaymentSetting.query.first():
-            payment_setting = PaymentSetting(id=1)
-            db.session.add(payment_setting)
-            db.session.commit()
-            print("✓ PaymentSetting инициализирован")
+        # Если колонок не хватает, ВСЕГДА используем raw SQL (не пытаемся ORM)
+        # чтобы избежать ошибок из-за несоответствия схемы
+        try:
+            if payment_migration_performed:
+                # Используем raw SQL, если колонок не хватает
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM payment_setting WHERE id = 1")
+                payment_exists = cursor.fetchone()[0] > 0
+                conn.close()
+            else:
+                # Используем ORM, если все колонки на месте
+                payment_exists = PaymentSetting.query.first() is not None
+        except:
+            # Если ORM не работает, пробуем через raw SQL
+            try:
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT COUNT(*) FROM payment_setting WHERE id = 1")
+                payment_exists = cursor.fetchone()[0] > 0
+                conn.close()
+            except:
+                payment_exists = False
+        
+        if not payment_exists:
+            # Если колонок не хватает, используем ТОЛЬКО raw SQL
+            if payment_migration_performed:
+                try:
+                    conn = sqlite3.connect(db_path)
+                    cursor = conn.cursor()
+                    # Проверяем еще раз перед вставкой
+                    cursor.execute("SELECT COUNT(*) FROM payment_setting WHERE id = 1")
+                    if cursor.fetchone()[0] == 0:
+                        cursor.execute("INSERT INTO payment_setting (id) VALUES (1)")
+                        conn.commit()
+                        print("✓ PaymentSetting инициализирован (через SQL, колонки неполные)")
+                    else:
+                        print("✓ PaymentSetting уже существует")
+                    conn.close()
+                except sqlite3.IntegrityError as e:
+                    if 'UNIQUE constraint' in str(e):
+                        print("✓ PaymentSetting уже существует")
+                    else:
+                        print(f"⚠️  Ошибка при создании PaymentSetting через SQL: {e}")
+                except Exception as e:
+                    print(f"⚠️  Ошибка при создании PaymentSetting через SQL: {e}")
+            else:
+                # Используем ORM, если все колонки на месте
+                try:
+                    payment_setting = PaymentSetting(id=1)
+                    db.session.add(payment_setting)
+                    db.session.commit()
+                    print("✓ PaymentSetting инициализирован")
+                except Exception as e:
+                    print(f"⚠️  Ошибка при создании PaymentSetting через ORM: {e}")
+                    # Если ORM не работает, пробуем через raw SQL
+                    try:
+                        db.session.rollback()
+                        conn = sqlite3.connect(db_path)
+                        cursor = conn.cursor()
+                        # Проверяем еще раз перед вставкой
+                        cursor.execute("SELECT COUNT(*) FROM payment_setting WHERE id = 1")
+                        if cursor.fetchone()[0] == 0:
+                            cursor.execute("INSERT INTO payment_setting (id) VALUES (1)")
+                            conn.commit()
+                            print("✓ PaymentSetting инициализирован (через SQL после ошибки ORM)")
+                        else:
+                            print("✓ PaymentSetting уже существует")
+                        conn.close()
+                    except sqlite3.IntegrityError as e2:
+                        if 'UNIQUE constraint' in str(e2):
+                            print("✓ PaymentSetting уже существует")
+                        else:
+                            print(f"⚠️  Ошибка при создании PaymentSetting через SQL: {e2}")
+                    except Exception as e2:
+                        print(f"⚠️  Ошибка при создании PaymentSetting через SQL: {e2}")
+                        try:
+                            db.session.rollback()
+                        except:
+                            pass
         
         # 4. BrandingSetting
-        if not BrandingSetting.query.first():
+        try:
+            branding_exists = BrandingSetting.query.first() is not None
+        except:
+            branding_exists = False
+        
+        if not branding_exists:
             branding_setting = BrandingSetting(
                 id=1,
                 logo_url=None,
@@ -3437,7 +4336,12 @@ def init_database():
         }
         
         for tier in tiers:
-            if not TariffFeatureSetting.query.filter_by(tier=tier).first():
+            try:
+                tier_exists = TariffFeatureSetting.query.filter_by(tier=tier).first() is not None
+            except:
+                tier_exists = False
+            
+            if not tier_exists:
                 features_json = json.dumps(default_features[tier], ensure_ascii=False)
                 tariff_feature = TariffFeatureSetting(
                     tier=tier,
