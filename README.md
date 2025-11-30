@@ -59,7 +59,7 @@ React-приложение для администраторов с полным
 - 🎨 Брендинг — настройка логотипа и текстов
 - ⚙️ Настройки — системные параметры
 
-### 3. Telegram Bot (`client_bot.py`)
+### 3. Telegram Bot (`client_bot.py`) - В разработке
 Telegram бот для клиентов с полным функционалом личного кабинета.
 
 **Функции:**
@@ -72,7 +72,7 @@ Telegram бот для клиентов с полным функционалом
 - 📱 Web App (Mini-App)
 - 🔐 Регистрация прямо в боте
 
-### 4. Telegram Mini-App (`miniapp/`)
+### 4. Telegram Mini-App (`miniapp/`)  - В разработке
 Веб-приложение, встроенное в Telegram, с современным дизайном и полным функционалом.
 
 **Возможности:**
@@ -114,7 +114,7 @@ Telegram бот для клиентов с полным функционалом
 - ₿ **Heleket** — криптовалюты
 - ⭐ **Telegram Stars** — внутренняя валюта Telegram
 - 💰 **YooKassa** — российская платежная система (RUB)
-
+- и др.
 ## 🛠️ Технологический стек
 
 ### Backend
@@ -157,7 +157,7 @@ Telegram бот для клиентов с полным функционалом
 ### 1. Клонирование репозитория
 
 ```bash
-git clone https://github.com/yourusername/stealthnet-vpn.git
+git clone https://github.com/GOFONCK/STEALTHNET-Admin-Panel.git
 cd stealthnet-vpn
 ```
 
@@ -184,7 +184,7 @@ python scripts/init_db.py
 python -m flask --app app make-admin your@email.com
 ```
 
-### 3. Настройка Admin Panel
+### 3. Настройка Admin Panel (Не требуется, в проекте лежит готовый build в папке frontend просто проксируйте ее)
 
 ```bash
 cd admin-panel
@@ -196,20 +196,6 @@ npm install
 npm run build
 ```
 
-### 4. Настройка Telegram Bot
-
-```bash
-# Установите зависимости для бота
-pip install -r client_bot_requirements.txt
-
-# Добавьте в .env:
-# CLIENT_BOT_TOKEN=your_telegram_bot_token
-# FLASK_API_URL=http://localhost:5000
-```
-
-### 5. Настройка Mini-App
-
-Mini-App находится в папке `miniapp/` и готов к использованию. Просто разместите файлы на вашем веб-сервере.
 
 ## ⚙️ Настройка
 
@@ -217,6 +203,7 @@ Mini-App находится в папке `miniapp/` и готов к испол
 
 ```env
 # Flask API
+ADMIN_TOKEN=
 JWT_SECRET_KEY=your_secret_key_here
 API_URL=https://your-vpn-api.com
 DEFAULT_SQUAD_ID=your_default_squad_id
@@ -236,9 +223,7 @@ MAIL_USE_TLS=True
 MAIL_USERNAME=your_email@gmail.com
 MAIL_PASSWORD=your_password
 
-# Database
-SQLALCHEMY_DATABASE_URI=sqlite:///stealthnet.db
-```
+
 
 ### Генерация Fernet ключа
 
@@ -277,46 +262,8 @@ stealthnet-vpn/
 ├── .gitignore                  # Git ignore правила
 ├── README.md                   # Этот файл
 │
-├── migrations/                  # Скрипты миграций БД
-│   ├── migrate_add_badge.py
-│   ├── migrate_add_encrypted_password.py
-│   ├── migrate_add_heleket.py
-│   ├── migrate_add_promo_code_id.py
-│   ├── migrate_add_telegram_bot_token.py
-│   ├── migrate_add_telegram_fields.py
-│   └── migrate_add_yookassa_fields.py
-│
-├── scripts/                    # Вспомогательные скрипты
-│   ├── init_db.py              # Инициализация БД
-│   ├── generate_fernet_key.py # Генерация ключа шифрования
-│   └── test_local_setup.py     # Тестирование
-│
-├── config/                     # Конфигурационные файлы
-│   ├── gunicorn_config.py      # Конфигурация Gunicorn
-│   ├── flask_api.service       # Systemd сервис для Flask
-│   ├── client_bot.service      # Systemd сервис для бота
-│   └── *.txt                   # Дополнительные конфиги
-│
-├── docs/                       # Документация
-│   ├── CLIENT_BOT_README.md    # Документация Telegram бота
-│   ├── ADMIN_PANEL_DESCRIPTION.md
-│   ├── PRODUCT_DESCRIPTION.md
-│   ├── GUNICORN_SETUP.md
-│   ├── MIGRATION_INSTRUCTIONS.md
-│   └── ...
-│
-├── admin-panel/                # React Admin Panel
-│   ├── src/
-│   │   ├── pages/              # Страницы
-│   │   ├── components/          # Компоненты
-│   │   └── ...
-│   ├── public/
-│   ├── package.json
+├── frontend/                # React Admin Panel
 │   └── build/                  # Production build
-│
-├── miniapp/                    # Telegram Mini-App
-│   ├── index.html
-│   └── README.md
 │
 ├── templates/                  # Email шаблоны
 │   ├── email_verification.html
@@ -326,15 +273,6 @@ stealthnet-vpn/
     ├── stealthnet.db           # SQLite база данных
     └── cache/                  # Кэш файлов
 ```
-
-## 📚 Документация
-
-- [Документация Telegram бота](docs/CLIENT_BOT_README.md)
-- [Описание Admin Panel](docs/ADMIN_PANEL_DESCRIPTION.md)
-- [Описание продукта](docs/PRODUCT_DESCRIPTION.md)
-- [Настройка Gunicorn](docs/GUNICORN_SETUP.md)
-- [Инструкции по миграциям](docs/MIGRATION_INSTRUCTIONS.md)
-- [Telegram Mini-App](miniapp/README.md)
 
 ## 🔧 Миграции базы данных
 
@@ -377,7 +315,7 @@ python migrations/migrate_add_yookassa_fields.py
 
 ## 📞 Поддержка
 
-- **Email:** support@stealthnet.app
+- **Email:** admin@stealthnet.app
 - **Telegram:** @stealthnet_support
 
 ## 📄 Лицензия
@@ -391,4 +329,5 @@ python migrations/migrate_add_yookassa_fields.py
 ---
 
 **StealthNET VPN** — Ваша свобода в цифровом мире 🛡️
+
 
