@@ -193,6 +193,23 @@ class Payment(db.Model):
 # ----------------------------------------------------
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ----------------------------------------------------
+def parse_iso_datetime(iso_string):
+    """
+    Парсит ISO формат даты, поддерживая как стандартный формат, так и формат с 'Z' (UTC).
+    Примеры:
+    - '2025-11-29T09:56:35.745Z' -> datetime
+    - '2025-11-29T09:56:35.745+00:00' -> datetime
+    - '2025-11-29T09:56:35' -> datetime
+    """
+    if not iso_string:
+        raise ValueError("Empty ISO string")
+    
+    # Заменяем 'Z' на '+00:00' для совместимости с fromisoformat
+    if iso_string.endswith('Z'):
+        iso_string = iso_string[:-1] + '+00:00'
+    
+    return datetime.fromisoformat(iso_string)
+
 def create_local_jwt(user_id):
     payload = {'iat': datetime.now(timezone.utc), 'exp': datetime.now(timezone.utc) + timedelta(days=1), 'sub': str(user_id) }
     token = jwt.encode(payload, current_app.config['JWT_SECRET_KEY'], algorithm="HS256")
@@ -280,7 +297,7 @@ def apply_referrer_bonus_in_background(app_context, referrer_uuid, bonus_days):
             resp = requests.get(f"{API_URL}/api/users/{referrer_uuid}", headers=admin_headers)
             if resp.ok:
                 live_data = resp.json().get('response', {})
-                curr = datetime.fromisoformat(live_data.get('expireAt'))
+                curr = parse_iso_datetime(live_data.get('expireAt'))
                 new_exp = max(datetime.now(timezone.utc), curr) + timedelta(days=bonus_days)
                 requests.patch(f"{API_URL}/api/users", 
                              headers={"Content-Type": "application/json", **admin_headers}, 
@@ -2683,7 +2700,7 @@ def crystal_webhook():
     
     h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
     live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
-    curr_exp = datetime.fromisoformat(live.get('expireAt'))
+    curr_exp = parse_iso_datetime(live.get('expireAt'))
     new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
     
     # Используем сквад из тарифа, если указан, иначе дефолтный
@@ -2757,7 +2774,7 @@ def heleket_webhook():
     
     h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
     live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
-    curr_exp = datetime.fromisoformat(live.get('expireAt'))
+    curr_exp = parse_iso_datetime(live.get('expireAt'))
     new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
     
     # Используем сквад из тарифа, если указан, иначе дефолтный
@@ -2912,9 +2929,13 @@ def telegram_set_webhook(current_admin):
         print(f"Telegram set webhook error: {e}")
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/webhook/yookassa', methods=['POST'])
+@app.route('/api/webhook/yookassa', methods=['GET', 'POST'])
 def yookassa_webhook():
     """Webhook для обработки уведомлений от YooKassa"""
+    # YooKassa может отправлять GET запрос для проверки доступности webhook
+    if request.method == 'GET':
+        return jsonify({"status": "ok", "message": "YooKassa webhook is available"}), 200
+    
     try:
         # YooKassa отправляет уведомления в формате JSON
         event_data = request.json
@@ -2957,7 +2978,7 @@ def yookassa_webhook():
             
             h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
             live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
-            curr_exp = datetime.fromisoformat(live.get('expireAt'))
+            curr_exp = parse_iso_datetime(live.get('expireAt'))
             new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
             
             # Используем сквад из тарифа, если указан, иначе дефолтный
@@ -4003,7 +4024,7 @@ def activate_promocode():
             if not resp_user.ok: return jsonify({"message": "Ошибка API провайдера"}), 500
             
             live_data = resp_user.json().get('response', {})
-            current_expire_at = datetime.fromisoformat(live_data.get('expireAt'))
+            current_expire_at = parse_iso_datetime(live_data.get('expireAt'))
             now = datetime.now(timezone.utc)
             
             # Если подписка истекла, добавляем к "сейчас". Если активна — продлеваем.
