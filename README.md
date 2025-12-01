@@ -174,7 +174,7 @@ source venv/bin/activate  # Linux/Mac
 venv\Scripts\activate  # Windows
 
 # Установите зависимости
-pip install -r requirements.txt
+pip3 install -r requirements.txt
 
 # Создайте файл .env
 nano .env
@@ -226,7 +226,7 @@ gunicorn --workers 3 --bind 127.0.0.1:5000 app:app --daemon
 ```
 # Создайте администратора
 ```
-python -m flask --app app make-admin your@email.com
+python3 -m flask --app app make-admin your@email.com
 ```
 
 
@@ -267,7 +267,8 @@ stealthnet-vpn/
 При обновлении системы может потребоваться выполнить миграции БД:
 
 # Через скрипт
-python migrate_add_yookassa_fields.py
+```
+python3 migrate_add_yookassa_fields.py
 ```
 
 
@@ -304,6 +305,7 @@ python migrate_add_yookassa_fields.py
 ---
 
 **StealthNET VPN** — Ваша свобода в цифровом мире 🛡️
+
 
 
 
