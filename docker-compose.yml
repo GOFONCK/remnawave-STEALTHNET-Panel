@@ -1,37 +1,23 @@
 version: '3.8'
 
-# Все пути в этом файле относительные (начинаются с ./)
-# Проект будет работать из любой директории: /opt/, /home/user/, /var/www/ и т.д.
-# Просто склонируйте репозиторий и запустите docker-compose up -d
-
 services:
-  # Flask API Backend
+  # Flask API сервер
   api:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: stealthnet-api
     restart: unless-stopped
-    volumes:
-      - ./data:/app/data
-      - ./instance:/app/instance
-      - ./templates:/app/templates
-    environment:
-      - ADMIN_TOKEN=${ADMIN_TOKEN}
-      - API_URL=${API_URL}
-      - DEFAULT_SQUAD_ID=${DEFAULT_SQUAD_ID}
-      - YOUR_SERVER_IP=${YOUR_SERVER_IP}
-      - FERNET_KEY=${FERNET_KEY}
-      - JWT_SECRET_KEY=${JWT_SECRET_KEY}
-      - BOT_API_URL=${BOT_API_URL}
-      - BOT_API_TOKEN=${BOT_API_TOKEN}
-      - TELEGRAM_BOT_NAME=${TELEGRAM_BOT_NAME}
-      - MAIL_SERVER=${MAIL_SERVER}
-      - MAIL_PORT=${MAIL_PORT:-465}
-      - MAIL_USERNAME=${MAIL_USERNAME}
-      - MAIL_PASSWORD=${MAIL_PASSWORD}
     ports:
       - "5000:5000"
+    volumes:
+      - ./instance:/app/instance
+      - ./cache:/app/cache
+      - ./logs:/app/logs
+      - ./.env:/app/.env
+    working_dir: /app
+    environment:
+      - FLASK_ENV=production
     networks:
       - stealthnet-network
     healthcheck:
@@ -41,49 +27,40 @@ services:
       retries: 3
       start_period: 40s
 
-  # Nginx для фронтенда и проксирования API
+  # Telegram Bot
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile.bot
+    container_name: stealthnet-bot
+    restart: unless-stopped
+    volumes:
+      - ./.env:/app/.env
+      - ./logo.png:/app/logo.png
+      - ./logs:/app/logs
+    depends_on:
+      - api
+    networks:
+      - stealthnet-network
+
+  # Nginx для проксирования и статики
   nginx:
     image: nginx:alpine
     container_name: stealthnet-nginx
     restart: unless-stopped
-    volumes:
-      - ./frontend/build:/usr/share/nginx/html:ro
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./nginx-logs:/var/log/nginx
     ports:
       - "80:80"
       - "443:443"
+    volumes:
+      - ./frontend/build:/var/www/stealthnet-client/build:ro
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./nginx/ssl:/etc/nginx/ssl:ro
     depends_on:
       - api
     networks:
       - stealthnet-network
-
-  # Caddy (альтернатива Nginx с автоматическим SSL)
-  caddy:
-    image: caddy:2-alpine
-    container_name: stealthnet-caddy
-    restart: unless-stopped
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ./frontend/build:/usr/share/caddy:ro
-      - caddy_data:/data
-      - caddy_config:/config
-    ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"
-    depends_on:
-      - api
-    networks:
-      - stealthnet-network
-    profiles:
-      - caddy  # Запускается только с профилем caddy
 
 networks:
   stealthnet-network:
     driver: bridge
-
-volumes:
-  caddy_data:
-  caddy_config:
 

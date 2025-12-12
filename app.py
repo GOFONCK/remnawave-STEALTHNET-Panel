@@ -28,6 +28,13 @@ ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
 API_URL = os.getenv("API_URL")
 DEFAULT_SQUAD_ID = os.getenv("DEFAULT_SQUAD_ID")
 YOUR_SERVER_IP_OR_DOMAIN = os.getenv("YOUR_SERVER_IP")
+# Нормализуем URL - убеждаемся, что он с протоколом
+if YOUR_SERVER_IP_OR_DOMAIN:
+    YOUR_SERVER_IP_OR_DOMAIN = YOUR_SERVER_IP_OR_DOMAIN.strip()
+    if not YOUR_SERVER_IP_OR_DOMAIN.startswith(('http://', 'https://')):
+        YOUR_SERVER_IP_OR_DOMAIN = f"https://{YOUR_SERVER_IP_OR_DOMAIN}"
+else:
+    YOUR_SERVER_IP_OR_DOMAIN = "https://panel.stealthnet.app"  # Fallback
 FERNET_KEY_STR = os.getenv("FERNET_KEY")
 BOT_API_URL = os.getenv("BOT_API_URL", "")  # URL веб-API бота (например, http://localhost:8080)
 BOT_API_TOKEN = os.getenv("BOT_API_TOKEN", "")  # Токен для доступа к API бота
@@ -60,7 +67,7 @@ CORS(app, resources={r"/api/.*": {
 
 # База данных и Секреты
 app.config['JWT_SECRET_KEY'] = os.getenv("JWT_SECRET_KEY")
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///stealthnet.db'
+app.config['SQLALCHEMY_DATABASE_URI'] = os.getenv('SQLALCHEMY_DATABASE_URI', 'sqlite:///instance/stealthnet.db')
 app.config['FERNET_KEY'] = FERNET_KEY_STR.encode() if FERNET_KEY_STR else None
 
 # Кэширование
@@ -97,6 +104,48 @@ mail = Mail(app)
 
 
 # ----------------------------------------------------
+# ФУНКЦИИ КОНВЕРТАЦИИ ВАЛЮТ
+# ----------------------------------------------------
+def get_currency_rate(currency):
+    """Получает курс валюты к USD из базы данных"""
+    currency = currency.upper() if currency else 'USD'
+    if currency == 'USD':
+        return 1.0
+    
+    # Пытаемся получить курс из базы данных, но только если таблица существует
+    try:
+        rate_obj = CurrencyRate.query.filter_by(currency=currency).first()
+        if rate_obj:
+            return float(rate_obj.rate_to_usd)
+    except:
+        pass  # Если таблица еще не создана, используем значения по умолчанию
+    
+    # Значения по умолчанию, если курс не установлен
+    default_rates = {
+        'UAH': 40.0,
+        'RUB': 100.0
+    }
+    return default_rates.get(currency, 1.0)
+
+def convert_to_usd(amount, currency):
+    """Конвертирует сумму из указанной валюты в USD"""
+    currency = currency.upper() if currency else 'USD'
+    if currency == 'USD':
+        return float(amount)
+    
+    rate = get_currency_rate(currency)
+    return float(amount) / rate
+
+def convert_from_usd(amount_usd, target_currency):
+    """Конвертирует сумму из USD в указанную валюту"""
+    target_currency = target_currency.lower() if target_currency else 'usd'
+    if target_currency == 'usd':
+        return float(amount_usd)
+    
+    rate = get_currency_rate(target_currency.upper())
+    return float(amount_usd) * rate
+
+# ----------------------------------------------------
 # МОДЕЛИ БАЗЫ ДАННЫХ
 # ----------------------------------------------------
 class User(db.Model):
@@ -114,6 +163,7 @@ class User(db.Model):
     preferred_currency = db.Column(db.String(5), default='uah')
     is_verified = db.Column(db.Boolean, nullable=False, default=True)  # Telegram пользователи считаются верифицированными
     verification_token = db.Column(db.String(100), unique=True, nullable=True)
+    balance = db.Column(db.Float, nullable=False, default=0.0)  # Баланс пользователя
     created_at = db.Column(db.DateTime, default=datetime.now(timezone.utc))
 
 class Tariff(db.Model):
@@ -134,6 +184,13 @@ class PromoCode(db.Model):
     promo_type = db.Column(db.String(20), nullable=False, default='PERCENT')
     value = db.Column(db.Integer, nullable=False) 
     uses_left = db.Column(db.Integer, nullable=False, default=1) 
+
+class CurrencyRate(db.Model):
+    """Модель для хранения курсов валют"""
+    id = db.Column(db.Integer, primary_key=True)
+    currency = db.Column(db.String(10), unique=True, nullable=False)  # 'UAH', 'RUB', 'USD'
+    rate_to_usd = db.Column(db.Float, nullable=False)  # Курс к USD (например, 40.0 для UAH означает 1 USD = 40 UAH)
+    updated_at = db.Column(db.DateTime, default=datetime.now(timezone.utc), onupdate=datetime.now(timezone.utc))
 
 class ReferralSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -185,6 +242,13 @@ class PaymentSetting(db.Model):
     btcpayserver_url = db.Column(db.Text, nullable=True)  # URL BTCPayServer (например, https://btcpay.example.com)
     btcpayserver_api_key = db.Column(db.Text, nullable=True)  # API ключ BTCPayServer
     btcpayserver_store_id = db.Column(db.Text, nullable=True)  # Store ID BTCPayServer
+    tribute_api_key = db.Column(db.Text, nullable=True)  # API ключ Tribute
+    robokassa_merchant_login = db.Column(db.Text, nullable=True)  # Логин магазина Robokassa
+    robokassa_password1 = db.Column(db.Text, nullable=True)  # Пароль #1 Robokassa (для подписания запросов)
+    robokassa_password2 = db.Column(db.Text, nullable=True)  # Пароль #2 Robokassa (для проверки уведомлений)
+    freekassa_shop_id = db.Column(db.Text, nullable=True)  # ID магазина Freekassa
+    freekassa_secret = db.Column(db.Text, nullable=True)  # Секретное слово Freekassa (для подписания запросов)
+    freekassa_secret2 = db.Column(db.Text, nullable=True)  # Секретное слово 2 Freekassa (для проверки уведомлений)
 
 class SystemSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -210,7 +274,7 @@ class Payment(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     order_id = db.Column(db.String(100), unique=True, nullable=False)
     user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
-    tariff_id = db.Column(db.Integer, db.ForeignKey('tariff.id'), nullable=False)
+    tariff_id = db.Column(db.Integer, db.ForeignKey('tariff.id'), nullable=True)  # Nullable для пополнения баланса
     status = db.Column(db.String(20), nullable=False, default='PENDING') 
     amount = db.Column(db.Float, nullable=False)
     currency = db.Column(db.String(5), nullable=False)
@@ -1403,12 +1467,17 @@ def get_client_me():
             # Это нужно, чтобы изменения настроек сразу отображались
             if isinstance(cached, dict):
                 cached = cached.copy()  # Создаем копию, чтобы не изменять оригинал в кэше
+                # Баланс хранится в USD, конвертируем в предпочитаемую валюту для бота
+                balance_usd = float(user.balance) if user.balance else 0.0
+                balance_converted = convert_from_usd(balance_usd, user.preferred_currency)
                 cached.update({
                     'referral_code': user.referral_code, 
                     'preferred_lang': user.preferred_lang, 
                     'preferred_currency': user.preferred_currency,
                     'telegram_id': user.telegram_id,
-                    'telegram_username': user.telegram_username
+                    'telegram_username': user.telegram_username,
+                    'balance_usd': balance_usd,  # Баланс в USD для конвертации на фронтенде
+                    'balance': balance_converted  # Баланс в предпочитаемой валюте для бота и обратной совместимости
                 })
             return jsonify({"response": cached}), 200
     
@@ -1450,12 +1519,17 @@ def get_client_me():
         
         # Добавляем данные из локальной БД
         if isinstance(data, dict):
+            # Баланс хранится в USD, конвертируем в предпочитаемую валюту для бота
+            balance_usd = float(user.balance) if user.balance else 0.0
+            balance_converted = convert_from_usd(balance_usd, user.preferred_currency)
             data.update({
                 'referral_code': user.referral_code, 
                 'preferred_lang': user.preferred_lang, 
                 'preferred_currency': user.preferred_currency,
                 'telegram_id': user.telegram_id,
-                'telegram_username': user.telegram_username
+                'telegram_username': user.telegram_username,
+                'balance_usd': balance_usd,  # Баланс в USD для конвертации на фронтенде
+                'balance': balance_converted  # Баланс в предпочитаемой валюте для бота и обратной совместимости
             })
         
         cache.set(cache_key, data, timeout=300)
@@ -2203,6 +2277,23 @@ def miniapp_payment_methods():
         btcpayserver_store_id = decrypt_key(s.btcpayserver_store_id) if s.btcpayserver_store_id else None
         if btcpayserver_url and btcpayserver_api_key and btcpayserver_store_id and btcpayserver_url != "DECRYPTION_ERROR" and btcpayserver_api_key != "DECRYPTION_ERROR" and btcpayserver_store_id != "DECRYPTION_ERROR":
             available.append({"id": "btcpayserver", "name": "BTCPayServer (Bitcoin)", "type": "redirect"})
+        
+        # Tribute
+        tribute_api_key = decrypt_key(s.tribute_api_key) if s.tribute_api_key else None
+        if tribute_api_key and tribute_api_key != "DECRYPTION_ERROR":
+            available.append({"id": "tribute", "name": "Tribute", "type": "redirect"})
+        
+        # Robokassa
+        robokassa_login = decrypt_key(s.robokassa_merchant_login) if s.robokassa_merchant_login else None
+        robokassa_password1 = decrypt_key(s.robokassa_password1) if s.robokassa_password1 else None
+        if robokassa_login and robokassa_password1 and robokassa_login != "DECRYPTION_ERROR" and robokassa_password1 != "DECRYPTION_ERROR":
+            available.append({"id": "robokassa", "name": "Robokassa", "type": "redirect"})
+        
+        # Freekassa
+        freekassa_shop_id = decrypt_key(s.freekassa_shop_id) if s.freekassa_shop_id else None
+        freekassa_secret = decrypt_key(s.freekassa_secret) if s.freekassa_secret else None
+        if freekassa_shop_id and freekassa_secret and freekassa_shop_id != "DECRYPTION_ERROR" and freekassa_secret != "DECRYPTION_ERROR":
+            available.append({"id": "freekassa", "name": "Freekassa", "type": "redirect"})
         
         response = jsonify({"methods": available})
         response.headers.add('Access-Control-Allow-Origin', '*')
@@ -3011,6 +3102,233 @@ def miniapp_create_payment():
                     "detail": {
                         "title": "Payment Error",
                         "message": f"BTCPayServer API Error: {error_msg}"
+                    }
+                }), 500
+        
+        elif payment_provider == 'tribute':
+            # Tribute API
+            tribute_api_key = decrypt_key(s.tribute_api_key) if s else None
+            
+            if not tribute_api_key or tribute_api_key == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Tribute API key not configured"
+                    }
+                }), 500
+            
+            # Tribute принимает сумму в минимальных единицах валюты (копейки для RUB, центы для EUR)
+            # Конвертируем валюту в формат Tribute (rub, eur)
+            currency_map = {
+                'RUB': 'rub',
+                'UAH': 'rub',  # UAH не поддерживается, используем RUB
+                'USD': 'eur'   # USD не поддерживается, используем EUR
+            }
+            tribute_currency = currency_map.get(info['c'], 'rub')
+            
+            # Конвертируем сумму в минимальные единицы (копейки/центы)
+            # final_amount в рублях/гривнах/долларах, нужно умножить на 100
+            amount_in_cents = int(final_amount * 100)
+            
+            # Формируем payload для создания заказа
+            payload = {
+                "amount": amount_in_cents,
+                "currency": tribute_currency,
+                "title": f"VPN Subscription - {t.name}"[:100],  # Макс 100 символов
+                "description": f"VPN subscription for {t.duration_days} days"[:300],  # Макс 300 символов
+                "successUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/miniapp/",
+                "failUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/miniapp/"
+            }
+            
+            # Добавляем email, если есть
+            if user.email:
+                payload["email"] = user.email
+            
+            # URL для создания заказа: POST /api/v1/shop/orders
+            order_url = "https://tribute.tg/api/v1/shop/orders"
+            
+            # Заголовки для авторизации
+            headers = {
+                "Content-Type": "application/json",
+                "Api-Key": tribute_api_key
+            }
+            
+            try:
+                resp = requests.post(
+                    order_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                order_data = resp.json()
+                
+                # Получаем paymentUrl и uuid из ответа
+                payment_url = order_data.get('paymentUrl')
+                payment_system_id = order_data.get('uuid')  # UUID заказа
+                
+                if not payment_url:
+                    error_msg = order_data.get('message') or 'Failed to get payment URL from Tribute'
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": error_msg
+                        }
+                    }), 500
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                    except:
+                        pass
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": f"Tribute API Error: {error_msg}"
+                    }
+                }), 500
+        
+        elif payment_provider == 'robokassa':
+            # Robokassa API
+            robokassa_login = decrypt_key(s.robokassa_merchant_login) if s else None
+            robokassa_password1 = decrypt_key(s.robokassa_password1) if s else None
+            
+            if not robokassa_login or not robokassa_password1 or robokassa_login == "DECRYPTION_ERROR" or robokassa_password1 == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Robokassa credentials not configured"
+                    }
+                }), 500
+            
+            # Robokassa работает только с RUB
+            # Если валюта не RUB, конвертируем или используем RUB
+            if info['c'] not in ['RUB', 'rub']:
+                # Для других валют используем RUB (можно добавить конвертацию)
+                robokassa_amount = final_amount  # Используем сумму как есть
+            else:
+                robokassa_amount = final_amount
+            
+            # Формируем описание платежа
+            description = f"VPN Subscription - {t.name} ({t.duration_days} days)"[:100]  # Макс 100 символов
+            
+            # Создаем MD5 подпись: MD5(MerchantLogin:OutSum:InvId:Password#1)
+            import hashlib
+            signature_string = f"{robokassa_login}:{robokassa_amount}:{order_id}:{robokassa_password1}"
+            signature = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+            
+            # Формируем URL для оплаты
+            import urllib.parse
+            params = {
+                'MerchantLogin': robokassa_login,
+                'OutSum': str(robokassa_amount),
+                'InvId': order_id,
+                'Description': description,
+                'SignatureValue': signature
+            }
+            
+            # Добавляем параметры для редиректа
+            success_url = f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/miniapp/"
+            fail_url = f"{YOUR_SERVER_IP_OR_DOMAIN}/miniapp/" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/miniapp/"
+            
+            params['SuccessURL'] = success_url
+            params['FailURL'] = fail_url
+            
+            # Формируем полный URL
+            query_string = urllib.parse.urlencode(params)
+            payment_url = f"https://auth.robokassa.ru/Merchant/Index.aspx?{query_string}"
+            payment_system_id = order_id  # Используем order_id как идентификатор
+        
+        elif payment_provider == 'freekassa':
+            # Freekassa API
+            freekassa_shop_id = decrypt_key(s.freekassa_shop_id) if s else None
+            freekassa_secret = decrypt_key(s.freekassa_secret) if s else None
+            
+            if not freekassa_shop_id or not freekassa_secret or freekassa_shop_id == "DECRYPTION_ERROR" or freekassa_secret == "DECRYPTION_ERROR":
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": "Freekassa credentials not configured"
+                    }
+                }), 500
+            
+            # Freekassa поддерживает валюты: RUB, USD, EUR, UAH, KZT
+            # Конвертируем валюту в формат Freekassa
+            currency_map = {
+                'RUB': 'RUB',
+                'UAH': 'UAH',
+                'USD': 'USD',
+                'EUR': 'EUR',
+                'KZT': 'KZT'
+            }
+            freekassa_currency = currency_map.get(info['c'], 'RUB')
+            
+            # Генерируем nonce (уникальный ID запроса, должен быть больше предыдущего)
+            import time
+            nonce = int(time.time() * 1000)  # Используем timestamp в миллисекундах
+            
+            # Формируем подпись: MD5(shopId + amount + currency + paymentId + secret)
+            import hashlib
+            signature_string = f"{freekassa_shop_id}{final_amount}{freekassa_currency}{order_id}{freekassa_secret}"
+            signature = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+            
+            # Параметры для создания заказа через API
+            api_params = {
+                'shopId': freekassa_shop_id,
+                'nonce': nonce,
+                'signature': signature,
+                'paymentId': order_id,
+                'amount': str(final_amount),
+                'currency': freekassa_currency
+            }
+            
+            # URL для создания заказа: POST https://api.fk.life/v1/orders/create
+            api_url = "https://api.fk.life/v1/orders/create"
+            
+            try:
+                resp = requests.post(
+                    api_url,
+                    params=api_params,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                order_data = resp.json()
+                
+                # Проверяем ответ
+                if order_data.get('type') == 'success':
+                    payment_url = order_data.get('data', {}).get('url')
+                    payment_system_id = order_data.get('data', {}).get('orderId') or order_id
+                    
+                    if not payment_url:
+                        error_msg = order_data.get('message') or 'Failed to get payment URL from Freekassa'
+                        return jsonify({
+                            "detail": {
+                                "title": "Payment Error",
+                                "message": error_msg
+                            }
+                        }), 500
+                else:
+                    error_msg = order_data.get('message') or 'Failed to create payment'
+                    return jsonify({
+                        "detail": {
+                            "title": "Payment Error",
+                            "message": error_msg
+                        }
+                    }), 500
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                    except:
+                        pass
+                return jsonify({
+                    "detail": {
+                        "title": "Payment Error",
+                        "message": f"Freekassa API Error: {error_msg}"
                     }
                 }), 500
         
@@ -3890,6 +4208,8 @@ def get_all_users(current_admin):
             combined.append({
                 "id": u.id, "email": u.email, "role": u.role, "remnawave_uuid": u.remnawave_uuid,
                 "referral_code": u.referral_code, "referrer_id": u.referrer_id, "is_verified": u.is_verified,
+                "balance": float(u.balance) if u.balance else 0.0,
+                "preferred_currency": u.preferred_currency or 'uah',
                 "live_data": {"response": live_map.get(u.remnawave_uuid)}
             })
         return jsonify(combined), 200
@@ -4020,14 +4340,97 @@ def delete_user(current_admin, user_id):
         u = db.session.get(User, user_id)
         if not u: return jsonify({"message": "Not found"}), 404
         if u.id == current_admin.id: return jsonify({"message": "Cannot delete self"}), 400
+        
+        # Удаляем все связанные записи перед удалением пользователя
+        
+        # 1. Удаляем сообщения тикетов, где пользователь является отправителем
+        TicketMessage.query.filter_by(sender_id=u.id).delete()
+        
+        # 2. Удаляем все тикеты пользователя и их сообщения
+        user_tickets = Ticket.query.filter_by(user_id=u.id).all()
+        for ticket in user_tickets:
+            # Удаляем все сообщения тикета
+            TicketMessage.query.filter_by(ticket_id=ticket.id).delete()
+            # Удаляем сам тикет
+            db.session.delete(ticket)
+        
+        # 3. Удаляем все платежи пользователя
+        Payment.query.filter_by(user_id=u.id).delete()
+        
+        # 4. Обнуляем referrer_id у пользователей, которые ссылаются на удаляемого пользователя
+        User.query.filter_by(referrer_id=u.id).update({User.referrer_id: None})
+        
         try:
             headers, cookies = get_remnawave_headers()
             requests.delete(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=headers, cookies=cookies)
         except: pass
         cache.delete('all_live_users_map')
-        db.session.delete(u); db.session.commit()
+        db.session.delete(u)
+        db.session.commit()
         return jsonify({"message": "Deleted"}), 200
-    except Exception as e: return jsonify({"message": str(e)}), 500
+    except Exception as e: 
+        db.session.rollback()
+        return jsonify({"message": str(e)}), 500
+
+@app.route('/api/admin/users/<int:user_id>/balance', methods=['PUT', 'PATCH'])
+@admin_required
+def update_user_balance(current_admin, user_id):
+    """Обновить баланс пользователя (добавить или установить)"""
+    try:
+        u = db.session.get(User, user_id)
+        if not u:
+            return jsonify({"message": "Пользователь не найден"}), 404
+        
+        data = request.json
+        action = data.get('action', 'set')  # 'set' - установить, 'add' - добавить, 'subtract' - списать
+        amount = data.get('amount', 0)
+        description = data.get('description', 'Изменение баланса администратором')
+        
+        if amount < 0:
+            return jsonify({"message": "Сумма не может быть отрицательной"}), 400
+        
+        # Получаем валюту из запроса или используем USD по умолчанию
+        currency = data.get('currency', 'USD').upper()
+        
+        # Конвертируем сумму в USD (баланс всегда хранится в USD)
+        amount_usd = convert_to_usd(float(amount), currency)
+        
+        current_balance_usd = float(u.balance) if u.balance else 0.0
+        
+        if action == 'set':
+            new_balance_usd = amount_usd
+        elif action == 'add':
+            new_balance_usd = current_balance_usd + amount_usd
+        elif action == 'subtract':
+            new_balance_usd = current_balance_usd - amount_usd
+            if new_balance_usd < 0:
+                return jsonify({"message": "Недостаточно средств на балансе"}), 400
+        else:
+            return jsonify({"message": "Неверное действие. Используйте: set, add, subtract"}), 400
+        
+        u.balance = new_balance_usd
+        db.session.commit()
+        
+        # Очищаем кэш пользователя
+        cache.delete(f'live_data_{u.remnawave_uuid}')
+        cache.delete('all_live_users_map')
+        
+        # Конвертируем баланс обратно в валюту пользователя для отображения
+        balance_display = convert_from_usd(new_balance_usd, u.preferred_currency)
+        previous_balance_display = convert_from_usd(current_balance_usd, u.preferred_currency)
+        change_display = convert_from_usd(new_balance_usd - current_balance_usd, u.preferred_currency)
+        
+        return jsonify({
+            "message": "Баланс успешно обновлен",
+            "balance": balance_display,
+            "previous_balance": previous_balance_display,
+            "change": change_display,
+            "balance_usd": float(new_balance_usd),
+            "currency": u.preferred_currency
+        }), 200
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": f"Ошибка обновления баланса: {str(e)}"}), 500
 
 # --- SQUADS (Сквады) ---
 @app.route('/api/admin/squads', methods=['GET'])
@@ -4100,7 +4503,7 @@ def get_nodes(current_admin):
             print(f"[NODES DEBUG] Первая нода (первые поля): {list(nodes_list[0].keys())[:10] if isinstance(nodes_list[0], dict) else 'not a dict'}")
             if isinstance(nodes_list[0], dict):
                 sample_node = nodes_list[0]
-                print(f"[NODES DEBUG] Пример полей: status={sample_node.get('status')}, isOnline={sample_node.get('isOnline')}, isActive={sample_node.get('isActive')}, state={sample_node.get('state')}")
+                print(f"[NODES DEBUG] Пример полей: status={sample_node.get('status')}, isOnline={sample_node.get('isOnline')}, isActive={sample_node.get('isActive')}, state={sample_node.get('state')}, isConnected={sample_node.get('isConnected')}")
         
         # Кэшируем на 2 минуты (ноды могут часто меняться)
         cache.set('nodes_list', nodes_list, timeout=120)
@@ -4698,6 +5101,100 @@ def system_settings(current_admin):
     except Exception as e:
         return jsonify({"message": str(e)}), 500
 
+@app.route('/api/public/currency-rates', methods=['GET'])
+def public_currency_rates():
+    """Публичный endpoint для получения курсов валют (для фронтенда)"""
+    try:
+        rates = CurrencyRate.query.all()
+    except:
+        rates = []
+    
+    rates_dict = {}
+    for rate in rates:
+        rates_dict[rate.currency] = float(rate.rate_to_usd)
+    
+    # Добавляем значения по умолчанию для валют, которых нет в БД
+    default_rates = {
+        'UAH': 40.0,
+        'RUB': 100.0,
+        'USD': 1.0
+    }
+    for currency, default_rate in default_rates.items():
+        if currency not in rates_dict:
+            rates_dict[currency] = default_rate
+    
+    return jsonify({"rates": rates_dict}), 200
+
+@app.route('/api/admin/currency-rates', methods=['GET', 'POST'])
+@admin_required
+def currency_rates(current_admin):
+    """Управление курсами валют"""
+    if request.method == 'GET':
+        # Получаем все курсы валют
+        try:
+            rates = CurrencyRate.query.all()
+        except:
+            # Если таблица еще не создана, возвращаем значения по умолчанию
+            rates = []
+        
+        rates_dict = {}
+        for rate in rates:
+            rates_dict[rate.currency] = {
+                'rate_to_usd': float(rate.rate_to_usd),
+                'updated_at': rate.updated_at.isoformat() if rate.updated_at else None
+            }
+        
+        # Добавляем значения по умолчанию для валют, которых нет в БД
+        default_rates = {
+            'UAH': 40.0,
+            'RUB': 100.0,
+            'USD': 1.0
+        }
+        for currency, default_rate in default_rates.items():
+            if currency not in rates_dict:
+                rates_dict[currency] = {
+                    'rate_to_usd': default_rate,
+                    'updated_at': None
+                }
+        
+        return jsonify({"rates": rates_dict}), 200
+    
+    # POST - обновление курсов
+    try:
+        data = request.json
+        rates_data = data.get('rates', {})
+        
+        for currency, rate_info in rates_data.items():
+            currency = currency.upper()
+            if currency == 'USD':
+                continue  # USD всегда равен 1.0
+            
+            rate_value = float(rate_info.get('rate_to_usd', rate_info) if isinstance(rate_info, dict) else rate_info)
+            
+            if rate_value <= 0:
+                return jsonify({"message": f"Курс для {currency} должен быть больше 0"}), 400
+            
+            # Ищем существующий курс или создаем новый
+            rate_obj = CurrencyRate.query.filter_by(currency=currency).first()
+            if rate_obj:
+                rate_obj.rate_to_usd = rate_value
+                rate_obj.updated_at = datetime.now(timezone.utc)
+            else:
+                rate_obj = CurrencyRate(currency=currency, rate_to_usd=rate_value)
+                db.session.add(rate_obj)
+        
+        db.session.commit()
+        
+        # Очищаем кэш, чтобы новые курсы сразу применялись
+        cache.clear()
+        
+        return jsonify({"message": "Курсы валют успешно обновлены"}), 200
+    except ValueError as e:
+        return jsonify({"message": f"Неверное значение курса: {str(e)}"}), 400
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": str(e)}), 500
+
 @app.route('/api/admin/branding', methods=['GET', 'POST'])
 @admin_required
 def branding_settings(current_admin):
@@ -4857,6 +5354,23 @@ def available_payment_methods():
     if btcpayserver_url and btcpayserver_api_key and btcpayserver_store_id and btcpayserver_url != "DECRYPTION_ERROR" and btcpayserver_api_key != "DECRYPTION_ERROR" and btcpayserver_store_id != "DECRYPTION_ERROR":
         available.append('btcpayserver')
     
+    # Tribute - нужен api_key
+    tribute_api_key = decrypt_key(s.tribute_api_key) if s.tribute_api_key else None
+    if tribute_api_key and tribute_api_key != "DECRYPTION_ERROR":
+        available.append('tribute')
+    
+    # Robokassa - нужны merchant_login и password1
+    robokassa_login = decrypt_key(s.robokassa_merchant_login) if s.robokassa_merchant_login else None
+    robokassa_password1 = decrypt_key(s.robokassa_password1) if s.robokassa_password1 else None
+    if robokassa_login and robokassa_password1 and robokassa_login != "DECRYPTION_ERROR" and robokassa_password1 != "DECRYPTION_ERROR":
+        available.append('robokassa')
+    
+    # Freekassa - нужны shop_id и secret
+    freekassa_shop_id = decrypt_key(s.freekassa_shop_id) if s.freekassa_shop_id else None
+    freekassa_secret = decrypt_key(s.freekassa_secret) if s.freekassa_secret else None
+    if freekassa_shop_id and freekassa_secret and freekassa_shop_id != "DECRYPTION_ERROR" and freekassa_secret != "DECRYPTION_ERROR":
+        available.append('freekassa')
+    
     return jsonify({"available_methods": available}), 200
 
 @app.route('/api/admin/payment-settings', methods=['GET', 'POST'])
@@ -4896,7 +5410,11 @@ def pay_settings(current_admin):
                     'monobank_token': 'TEXT',
                     'btcpayserver_url': 'TEXT',
                     'btcpayserver_api_key': 'TEXT',
-                    'btcpayserver_store_id': 'TEXT'
+                    'btcpayserver_store_id': 'TEXT',
+                    'tribute_api_key': 'TEXT',
+                    'robokassa_merchant_login': 'TEXT',
+                    'robokassa_password1': 'TEXT',
+                    'robokassa_password2': 'TEXT'
                 }
                 
                 for col_name, col_type in required_columns.items():
@@ -4943,6 +5461,13 @@ def pay_settings(current_admin):
         s.btcpayserver_url = encrypt_key(d.get('btcpayserver_url', ''))
         s.btcpayserver_api_key = encrypt_key(d.get('btcpayserver_api_key', ''))
         s.btcpayserver_store_id = encrypt_key(d.get('btcpayserver_store_id', ''))
+        s.tribute_api_key = encrypt_key(d.get('tribute_api_key', ''))
+        s.robokassa_merchant_login = encrypt_key(d.get('robokassa_merchant_login', ''))
+        s.robokassa_password1 = encrypt_key(d.get('robokassa_password1', ''))
+        s.robokassa_password2 = encrypt_key(d.get('robokassa_password2', ''))
+        s.freekassa_shop_id = encrypt_key(d.get('freekassa_shop_id', ''))
+        s.freekassa_secret = encrypt_key(d.get('freekassa_secret', ''))
+        s.freekassa_secret2 = encrypt_key(d.get('freekassa_secret2', ''))
         db.session.commit()
     return jsonify({
         "crystalpay_api_key": decrypt_key(s.crystalpay_api_key), 
@@ -4962,16 +5487,770 @@ def pay_settings(current_admin):
         "monobank_token": decrypt_key(s.monobank_token),
         "btcpayserver_url": decrypt_key(s.btcpayserver_url),
         "btcpayserver_api_key": decrypt_key(s.btcpayserver_api_key),
-        "btcpayserver_store_id": decrypt_key(s.btcpayserver_store_id)
+        "btcpayserver_store_id": decrypt_key(s.btcpayserver_store_id),
+        "tribute_api_key": decrypt_key(s.tribute_api_key),
+        "robokassa_merchant_login": decrypt_key(s.robokassa_merchant_login),
+        "robokassa_password1": decrypt_key(s.robokassa_password1),
+        "robokassa_password2": decrypt_key(s.robokassa_password2),
+        "freekassa_shop_id": decrypt_key(s.freekassa_shop_id),
+        "freekassa_secret": decrypt_key(s.freekassa_secret),
+        "freekassa_secret2": decrypt_key(s.freekassa_secret2)
     }), 200
+
+@app.route('/api/client/purchase-with-balance', methods=['POST'])
+@limiter.limit("10 per minute")
+def purchase_with_balance():
+    """Покупка тарифа с баланса пользователя"""
+    user = get_user_from_token()
+    if not user:
+        return jsonify({"message": "Auth Error"}), 401
+    
+    try:
+        data = request.json
+        tariff_id = data.get('tariff_id')
+        promo_code_str = data.get('promo_code', '').strip().upper() if data.get('promo_code') else None
+        
+        if not tariff_id:
+            return jsonify({"message": "tariff_id is required"}), 400
+        
+        # Получаем тариф
+        t = db.session.get(Tariff, tariff_id)
+        if not t:
+            return jsonify({"message": "Тариф не найден"}), 404
+        
+        # Определяем цену в валюте пользователя
+        price_map = {"uah": {"a": t.price_uah, "c": "UAH"}, "rub": {"a": t.price_rub, "c": "RUB"}, "usd": {"a": t.price_usd, "c": "USD"}}
+        info = price_map.get(user.preferred_currency, price_map['uah'])
+        
+        # Применяем промокод, если указан
+        promo_code_obj = None
+        final_amount = info['a']
+        if promo_code_str:
+            promo = PromoCode.query.filter_by(code=promo_code_str).first()
+            if not promo:
+                return jsonify({"message": "Неверный промокод"}), 400
+            if promo.uses_left <= 0:
+                return jsonify({"message": "Промокод больше не действителен"}), 400
+            if promo.promo_type == 'PERCENT':
+                discount = (promo.value / 100.0) * final_amount
+                final_amount = final_amount - discount
+                if final_amount < 0:
+                    final_amount = 0
+                promo_code_obj = promo
+            elif promo.promo_type == 'DAYS':
+                return jsonify({"message": "Промокод на бесплатные дни активируется отдельно"}), 400
+        
+        # Проверяем баланс пользователя
+        # Баланс хранится в USD, конвертируем цену тарифа в USD
+        current_balance_usd = float(user.balance) if user.balance else 0.0
+        final_amount_usd = convert_to_usd(final_amount, info['c'])
+        
+        if current_balance_usd < final_amount_usd:
+            # Для сообщения об ошибке конвертируем баланс обратно в валюту пользователя
+            current_balance_display = convert_from_usd(current_balance_usd, user.preferred_currency)
+            return jsonify({
+                "message": f"Недостаточно средств на балансе. Требуется: {final_amount:.2f} {info['c']}, доступно: {current_balance_display:.2f} {info['c']}"
+            }), 400
+        
+        # Списываем средства с баланса (в USD)
+        user.balance = current_balance_usd - final_amount_usd
+        
+        # Активируем тариф
+        h, c = get_remnawave_headers()
+        live = requests.get(f"{API_URL}/api/users/{user.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
+        curr_exp = parse_iso_datetime(live.get('expireAt'))
+        new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
+        
+        # Используем сквад из тарифа, если указан, иначе дефолтный
+        squad_id = t.squad_id if t.squad_id else DEFAULT_SQUAD_ID
+        
+        # Формируем payload для обновления пользователя
+        patch_payload = {
+            "uuid": user.remnawave_uuid,
+            "expireAt": new_exp.isoformat(),
+            "activeInternalSquads": [squad_id]
+        }
+        
+        # Добавляем лимит трафика, если указан в тарифе
+        if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
+            patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
+            patch_payload["trafficLimitStrategy"] = "NO_RESET"
+        
+        h, c = get_remnawave_headers({"Content-Type": "application/json"})
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
+        if not patch_resp.ok:
+            # Откатываем списание баланса
+            user.balance = current_balance_usd
+            db.session.rollback()
+            return jsonify({"message": "Ошибка активации тарифа"}), 500
+        
+        # Списываем использование промокода, если он был использован
+        if promo_code_obj:
+            if promo_code_obj.uses_left > 0:
+                promo_code_obj.uses_left -= 1
+        
+        # Создаем запись о платеже
+        order_id = f"u{user.id}-t{t.id}-balance-{int(datetime.now().timestamp())}"
+        new_p = Payment(
+            order_id=order_id,
+            user_id=user.id,
+            tariff_id=t.id,
+            status='PAID',
+            amount=final_amount,
+            currency=info['c'],
+            payment_provider='balance',
+            promo_code_id=promo_code_obj.id if promo_code_obj else None
+        )
+        db.session.add(new_p)
+        db.session.commit()
+        
+        # Очищаем кэш
+        cache.delete(f'live_data_{user.remnawave_uuid}')
+        cache.delete(f'nodes_{user.remnawave_uuid}')
+        cache.delete('all_live_users_map')
+        
+        # Конвертируем баланс обратно в валюту пользователя для отображения
+        balance_display = convert_from_usd(float(user.balance), user.preferred_currency)
+        
+        return jsonify({
+            "message": "Тариф успешно активирован",
+            "balance": balance_display,
+            "tariff_id": t.id,
+            "tariff_name": t.name
+        }), 200
+        
+    except Exception as e:
+        db.session.rollback()
+        print(f"Purchase with balance error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Internal Error"}), 500
 
 @app.route('/api/client/create-payment', methods=['POST'])
 def create_payment():
     user = get_user_from_token()
     if not user: return jsonify({"message": "Auth Error"}), 401
     try:
-        # 🛡️ TYPE CHECK
+        # Проверяем, это пополнение баланса или покупка тарифа
+        payment_type = request.json.get('type', 'tariff')
         tid = request.json.get('tariff_id')
+        
+        # Если это пополнение баланса, обрабатываем отдельно
+        if payment_type == 'balance_topup' or tid is None:
+            amount = request.json.get('amount', 0)
+            currency = request.json.get('currency', user.preferred_currency or 'uah')
+            payment_provider = request.json.get('payment_provider', 'crystalpay')
+            
+            if not amount or amount <= 0:
+                return jsonify({"message": "Неверная сумма"}), 400
+            
+            # Создаем платеж для пополнения баланса
+            s = PaymentSetting.query.first()
+            order_id = f"u{user.id}-balance-{int(datetime.now().timestamp())}"
+            payment_url = None
+            payment_system_id = None
+            
+            # Используем ту же логику создания платежа, что и для тарифов
+            # но без тарифа
+            currency_code_map = {"uah": "UAH", "rub": "RUB", "usd": "USD"}
+            cp_currency = currency_code_map.get(currency.lower(), "UAH")
+            
+            if payment_provider == 'crystalpay':
+                crystalpay_key = decrypt_key(s.crystalpay_api_key) if s else None
+                crystalpay_secret = decrypt_key(s.crystalpay_api_secret) if s else None
+                if not crystalpay_key or crystalpay_key == "DECRYPTION_ERROR" or not crystalpay_secret or crystalpay_secret == "DECRYPTION_ERROR":
+                    return jsonify({"message": "CrystalPay не настроен"}), 500
+                
+                # Используем v3 API для создания платежа (как в обычной покупке тарифа)
+                payload = {
+                    "auth_login": crystalpay_key,
+                    "auth_secret": crystalpay_secret,
+                    "amount": f"{float(amount):.2f}",
+                    "type": "purchase",
+                    "currency": cp_currency,
+                    "lifetime": 60,
+                    "extra": order_id,
+                    "callback_url": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/crystalpay",
+                    "redirect_url": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
+                }
+                
+                resp = requests.post("https://api.crystalpay.io/v3/invoice/create/", json=payload, timeout=10)
+                if resp.ok:
+                    data = resp.json()
+                    if not data.get('errors'):
+                        payment_url = data.get('url')
+                        payment_system_id = data.get('id')
+                    else:
+                        print(f"CrystalPay Error for balance topup: {data.get('errors')}")
+                else:
+                    print(f"CrystalPay API Error: {resp.status_code} - {resp.text}")
+            
+            elif payment_provider == 'heleket':
+                heleket_key = decrypt_key(s.heleket_api_key) if s else None
+                if not heleket_key or heleket_key == "DECRYPTION_ERROR":
+                    return jsonify({"message": "Heleket API key not configured"}), 500
+                
+                # Heleket поддерживает USD напрямую, для других валют используем конвертацию через to_currency
+                heleket_currency = cp_currency
+                to_currency = None
+                
+                if cp_currency == 'USD':
+                    heleket_currency = "USD"
+                else:
+                    heleket_currency = "USD"
+                    to_currency = "USDT"
+                
+                payload = {
+                    "amount": f"{float(amount):.2f}",
+                    "currency": heleket_currency,
+                    "order_id": order_id,
+                    "url_return": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                    "url_callback": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/heleket"
+                }
+                
+                if to_currency:
+                    payload["to_currency"] = to_currency
+                
+                headers = {
+                    "Authorization": f"Bearer {heleket_key}",
+                    "Content-Type": "application/json"
+                }
+                
+                resp = requests.post("https://api.heleket.com/v1/payment", json=payload, headers=headers, timeout=10)
+                if resp.ok:
+                    data = resp.json()
+                    if data.get('state') == 0 and data.get('result'):
+                        result = data.get('result', {})
+                        payment_url = result.get('url')
+                        payment_system_id = result.get('uuid')
+                    else:
+                        print(f"Heleket Error for balance topup: {data.get('message')}")
+                else:
+                    print(f"Heleket API Error: {resp.status_code} - {resp.text}")
+            
+            elif payment_provider == 'yookassa':
+                yookassa_shop = decrypt_key(s.yookassa_shop_id) if s else None
+                yookassa_secret = decrypt_key(s.yookassa_secret_key) if s else None
+                if not yookassa_shop or not yookassa_secret or yookassa_shop == "DECRYPTION_ERROR" or yookassa_secret == "DECRYPTION_ERROR":
+                    return jsonify({"message": "YooKassa credentials not configured"}), 500
+                
+                if cp_currency != 'RUB':
+                    return jsonify({"message": "YooKassa поддерживает только валюту RUB. Пожалуйста, выберите другую платежную систему или измените валюту на RUB."}), 400
+                
+                import uuid
+                import base64
+                idempotence_key = str(uuid.uuid4())
+                
+                payload = {
+                    "amount": {
+                        "value": f"{float(amount):.2f}",
+                        "currency": "RUB"
+                    },
+                    "capture": True,
+                    "confirmation": {
+                        "type": "redirect",
+                        "return_url": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
+                    },
+                    "description": f"Пополнение баланса на сумму {float(amount):.2f} RUB",
+                    "metadata": {
+                        "order_id": order_id
+                    }
+                }
+                
+                auth_string = f"{yookassa_shop}:{yookassa_secret}"
+                auth_bytes = auth_string.encode('ascii')
+                auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+                
+                headers = {
+                    "Authorization": f"Basic {auth_b64}",
+                    "Idempotence-Key": idempotence_key,
+                    "Content-Type": "application/json"
+                }
+                
+                try:
+                    resp = requests.post("https://api.yookassa.ru/v3/payments", json=payload, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    if data.get('status') != 'pending':
+                        error_msg = data.get('description', 'YooKassa payment creation failed')
+                        print(f"YooKassa Error: {error_msg}")
+                    else:
+                        confirmation = data.get('confirmation', {})
+                        payment_url = confirmation.get('confirmation_url')
+                        payment_system_id = data.get('id')
+                        if not payment_url:
+                            print(f"YooKassa Error: No confirmation URL")
+                except requests.exceptions.RequestException as e:
+                    print(f"YooKassa API Error: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            error_data = e.response.json()
+                            error_msg = error_data.get('description', str(e))
+                        except:
+                            error_msg = str(e)
+                    else:
+                        error_msg = str(e)
+                    print(f"YooKassa Error: {error_msg}")
+            
+            elif payment_provider == 'platega':
+                import uuid
+                platega_key = decrypt_key(s.platega_api_key) if s else None
+                platega_merchant = decrypt_key(s.platega_merchant_id) if s else None
+                if not platega_key or not platega_merchant or platega_key == "DECRYPTION_ERROR" or platega_merchant == "DECRYPTION_ERROR":
+                    return jsonify({"message": "Platega credentials not configured"}), 500
+                
+                transaction_uuid = str(uuid.uuid4())
+                
+                payload = {
+                    "paymentMethod": 2,  # 2 - СБП/QR, 10 - CardRu, 12 - International
+                    "id": transaction_uuid,
+                    "paymentDetails": {
+                        "amount": int(float(amount)),
+                        "currency": cp_currency
+                    },
+                    "description": f"Пополнение баланса на сумму {float(amount):.2f} {cp_currency}",
+                    "return": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                    "failedUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
+                }
+                
+                headers = {
+                    "Content-Type": "application/json",
+                    "X-MerchantId": platega_merchant,
+                    "X-Secret": platega_key
+                }
+                
+                try:
+                    resp = requests.post("https://app.platega.io/transaction/process", json=payload, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    payment_url = data.get('redirect')
+                    payment_system_id = data.get('transactionId') or transaction_uuid
+                    if not payment_url:
+                        print(f"Platega Error for balance topup: {data.get('message', 'No redirect URL')}")
+                except requests.exceptions.RequestException as e:
+                    print(f"Platega API Error: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            error_data = e.response.json()
+                            error_msg = error_data.get('message', str(e))
+                        except:
+                            error_msg = str(e)
+                    else:
+                        error_msg = str(e)
+                    print(f"Platega Error: {error_msg}")
+            
+            elif payment_provider == 'mulenpay':
+                mulenpay_key = decrypt_key(s.mulenpay_api_key) if s else None
+                mulenpay_secret = decrypt_key(s.mulenpay_secret_key) if s else None
+                mulenpay_shop = decrypt_key(s.mulenpay_shop_id) if s else None
+                if not mulenpay_key or not mulenpay_secret or not mulenpay_shop or mulenpay_key == "DECRYPTION_ERROR" or mulenpay_secret == "DECRYPTION_ERROR" or mulenpay_shop == "DECRYPTION_ERROR":
+                    return jsonify({"message": "Mulenpay credentials not configured"}), 500
+                
+                currency_map = {
+                    'RUB': 'rub',
+                    'UAH': 'uah',
+                    'USD': 'usd'
+                }
+                mulenpay_currency = currency_map.get(cp_currency, cp_currency.lower())
+                
+                try:
+                    shop_id_int = int(mulenpay_shop)
+                except (ValueError, TypeError):
+                    shop_id_int = mulenpay_shop
+                
+                payload = {
+                    "currency": mulenpay_currency,
+                    "amount": str(float(amount)),
+                    "uuid": order_id,
+                    "shopId": shop_id_int,
+                    "description": f"Пополнение баланса на сумму {float(amount):.2f} {cp_currency}",
+                    "subscribe": None,
+                    "holdTime": None
+                }
+                
+                import base64
+                auth_string = f"{mulenpay_key}:{mulenpay_secret}"
+                auth_bytes = auth_string.encode('ascii')
+                auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+                
+                headers = {
+                    "Authorization": f"Basic {auth_b64}",
+                    "Content-Type": "application/json"
+                }
+                
+                try:
+                    resp = requests.post("https://api.mulenpay.ru/v2/payments", json=payload, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    payment_url = data.get('url') or data.get('payment_url') or data.get('redirect')
+                    payment_system_id = data.get('id') or data.get('payment_id') or order_id
+                    if not payment_url:
+                        print(f"Mulenpay Error for balance topup: {data.get('message', 'No payment URL')}")
+                except requests.exceptions.RequestException as e:
+                    print(f"Mulenpay API Error: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            error_data = e.response.json()
+                            error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                        except:
+                            error_msg = str(e)
+                    else:
+                        error_msg = str(e)
+                    print(f"Mulenpay Error: {error_msg}")
+            
+            elif payment_provider == 'urlpay':
+                urlpay_key = decrypt_key(s.urlpay_api_key) if s else None
+                urlpay_secret = decrypt_key(s.urlpay_secret_key) if s else None
+                urlpay_shop = decrypt_key(s.urlpay_shop_id) if s else None
+                if not urlpay_key or not urlpay_secret or not urlpay_shop or urlpay_key == "DECRYPTION_ERROR" or urlpay_secret == "DECRYPTION_ERROR" or urlpay_shop == "DECRYPTION_ERROR":
+                    return jsonify({"message": "UrlPay credentials not configured"}), 500
+                
+                currency_map = {
+                    'RUB': 'rub',
+                    'UAH': 'uah',
+                    'USD': 'usd'
+                }
+                urlpay_currency = currency_map.get(cp_currency, cp_currency.lower())
+                
+                try:
+                    shop_id_int = int(urlpay_shop)
+                except (ValueError, TypeError):
+                    shop_id_int = urlpay_shop
+                
+                payload = {
+                    "currency": urlpay_currency,
+                    "amount": str(float(amount)),
+                    "uuid": order_id,
+                    "shopId": shop_id_int,
+                    "description": f"Пополнение баланса на сумму {float(amount):.2f} {cp_currency}",
+                    "subscribe": None,
+                    "holdTime": None
+                }
+                
+                import base64
+                auth_string = f"{urlpay_key}:{urlpay_secret}"
+                auth_bytes = auth_string.encode('ascii')
+                auth_b64 = base64.b64encode(auth_bytes).decode('ascii')
+                
+                headers = {
+                    "Authorization": f"Basic {auth_b64}",
+                    "Content-Type": "application/json"
+                }
+                
+                try:
+                    resp = requests.post("https://api.urlpay.io/v2/payments", json=payload, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    payment_url = data.get('url') or data.get('payment_url') or data.get('redirect')
+                    payment_system_id = data.get('id') or data.get('payment_id') or order_id
+                    if not payment_url:
+                        print(f"UrlPay Error for balance topup: {data.get('message', 'No payment URL')}")
+                except requests.exceptions.RequestException as e:
+                    print(f"UrlPay API Error: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            error_data = e.response.json()
+                            error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                        except:
+                            error_msg = str(e)
+                    else:
+                        error_msg = str(e)
+                    print(f"UrlPay Error: {error_msg}")
+            
+            elif payment_provider == 'monobank':
+                monobank_token = decrypt_key(s.monobank_token) if s else None
+                if not monobank_token or monobank_token == "DECRYPTION_ERROR":
+                    return jsonify({"message": "Monobank token not configured"}), 500
+                
+                # Monobank принимает сумму в копейках (минимальных единицах)
+                # Конвертируем сумму в копейки
+                amount_in_kopecks = int(float(amount) * 100)
+                if cp_currency == 'UAH':
+                    amount_in_kopecks = int(float(amount) * 100)  # UAH в копейках
+                elif cp_currency == 'RUB':
+                    amount_in_kopecks = int(float(amount) * 100)  # RUB в копейках
+                elif cp_currency == 'USD':
+                    amount_in_kopecks = int(float(amount) * 100)  # USD в центах
+                
+                # Код валюты по ISO 4217: 980 = UAH, 643 = RUB, 840 = USD
+                currency_code = 980  # По умолчанию UAH
+                if cp_currency == 'RUB':
+                    currency_code = 643
+                elif cp_currency == 'USD':
+                    currency_code = 840
+                
+                payload = {
+                    "amount": amount_in_kopecks,
+                    "ccy": currency_code,
+                    "merchantPaymInfo": {
+                        "reference": order_id,
+                        "destination": f"Пополнение баланса на сумму {float(amount):.2f} {cp_currency}",
+                        "basketOrder": [
+                            {
+                                "name": "Пополнение баланса",
+                                "qty": 1,
+                                "sum": amount_in_kopecks,
+                                "unit": "шт"
+                            }
+                        ]
+                    },
+                    "redirectUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                    "webHookUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/monobank",
+                    "validity": 86400,  # 24 часа в секундах
+                    "paymentType": "debit"
+                }
+                
+                headers = {
+                    "X-Token": monobank_token,
+                    "Content-Type": "application/json"
+                }
+                
+                try:
+                    resp = requests.post("https://api.monobank.ua/api/merchant/invoice/create", json=payload, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    payment_url = data.get('pageUrl')
+                    payment_system_id = data.get('invoiceId') or order_id
+                    if not payment_url:
+                        print(f"Monobank Error for balance topup: {data.get('errText', 'No payment URL')}")
+                except requests.exceptions.RequestException as e:
+                    print(f"Monobank API Error: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            error_data = e.response.json()
+                            error_msg = error_data.get('errText') or error_data.get('message') or str(e)
+                        except:
+                            error_msg = str(e)
+                    else:
+                        error_msg = str(e)
+                    print(f"Monobank Error: {error_msg}")
+            
+            elif payment_provider == 'btcpayserver':
+                btcpayserver_url = decrypt_key(s.btcpayserver_url) if s else None
+                btcpayserver_api_key = decrypt_key(s.btcpayserver_api_key) if s else None
+                btcpayserver_store_id = decrypt_key(s.btcpayserver_store_id) if s else None
+                if not btcpayserver_url or not btcpayserver_api_key or not btcpayserver_store_id or btcpayserver_url == "DECRYPTION_ERROR" or btcpayserver_api_key == "DECRYPTION_ERROR" or btcpayserver_store_id == "DECRYPTION_ERROR":
+                    return jsonify({"message": "BTCPayServer credentials not configured"}), 500
+                
+                btcpayserver_url = btcpayserver_url.rstrip('/')
+                invoice_currency = cp_currency
+                
+                metadata = {
+                    "orderId": order_id,
+                    "buyerEmail": user.email if user.email else None,
+                    "itemDesc": f"Пополнение баланса на сумму {float(amount):.2f} {cp_currency}"
+                }
+                
+                checkout_options = {
+                    "redirectURL": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
+                }
+                
+                payload = {
+                    "amount": f"{float(amount):.2f}",
+                    "currency": invoice_currency,
+                    "metadata": metadata,
+                    "checkout": checkout_options
+                }
+                
+                invoice_url = f"{btcpayserver_url}/api/v1/stores/{btcpayserver_store_id}/invoices"
+                
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"token {btcpayserver_api_key}"
+                }
+                
+                try:
+                    resp = requests.post(invoice_url, json=payload, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    invoice_data = resp.json()
+                    payment_url = invoice_data.get('checkoutLink')
+                    payment_system_id = invoice_data.get('id')
+                    if not payment_url:
+                        print(f"BTCPayServer Error for balance topup: No checkoutLink in response")
+                except requests.exceptions.RequestException as e:
+                    print(f"BTCPayServer API Error: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            error_data = e.response.json()
+                            error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                        except:
+                            error_msg = str(e)
+                    else:
+                        error_msg = str(e)
+                    print(f"BTCPayServer Error: {error_msg}")
+            
+            elif payment_provider == 'tribute':
+                tribute_api_key = decrypt_key(s.tribute_api_key) if s else None
+                if not tribute_api_key or tribute_api_key == "DECRYPTION_ERROR":
+                    return jsonify({"message": "Tribute API key not configured"}), 500
+                
+                currency_map = {
+                    'RUB': 'rub',
+                    'UAH': 'rub',  # UAH не поддерживается, используем RUB
+                    'USD': 'eur'   # USD не поддерживается, используем EUR
+                }
+                tribute_currency = currency_map.get(cp_currency, 'rub')
+                
+                amount_in_cents = int(float(amount) * 100)
+                
+                payload = {
+                    "amount": amount_in_cents,
+                    "currency": tribute_currency,
+                    "title": f"Пополнение баланса StealthNET"[:100],
+                    "description": f"Пополнение баланса на сумму {float(amount):.2f} {cp_currency}"[:300],
+                    "successUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                    "failUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
+                }
+                
+                if user.email:
+                    payload["email"] = user.email
+                
+                headers = {
+                    "Content-Type": "application/json",
+                    "Api-Key": tribute_api_key
+                }
+                
+                try:
+                    resp = requests.post("https://tribute.tg/api/v1/shop/orders", json=payload, headers=headers, timeout=30)
+                    resp.raise_for_status()
+                    data = resp.json()
+                    payment_url = data.get('paymentUrl')
+                    payment_system_id = data.get('uuid')
+                    if not payment_url:
+                        print(f"Tribute Error for balance topup: {data.get('message', 'No payment URL')}")
+                except requests.exceptions.RequestException as e:
+                    print(f"Tribute API Error: {e}")
+                    if hasattr(e, 'response') and e.response is not None:
+                        try:
+                            error_data = e.response.json()
+                            error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                        except:
+                            error_msg = str(e)
+                    else:
+                        error_msg = str(e)
+                    print(f"Tribute Error: {error_msg}")
+            
+            elif payment_provider == 'robokassa':
+                robokassa_login = decrypt_key(s.robokassa_merchant_login) if s else None
+                robokassa_password1 = decrypt_key(s.robokassa_password1) if s else None
+                if not robokassa_login or not robokassa_password1 or robokassa_login == "DECRYPTION_ERROR" or robokassa_password1 == "DECRYPTION_ERROR":
+                    return jsonify({"message": "Robokassa credentials not configured"}), 500
+                
+                import hashlib
+                signature_string = f"{robokassa_login}:{float(amount)}:{order_id}:{robokassa_password1}"
+                signature = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+                
+                payment_url = f"https://auth.robokassa.ru/Merchant/Index.aspx?MerchantLogin={robokassa_login}&OutSum={float(amount)}&InvId={order_id}&SignatureValue={signature}&Description=Пополнение баланса&Culture=ru&IsTest=0"
+                payment_system_id = order_id
+            
+            elif payment_provider == 'freekassa':
+                freekassa_shop_id = decrypt_key(s.freekassa_shop_id) if s else None
+                freekassa_secret = decrypt_key(s.freekassa_secret) if s else None
+                if not freekassa_shop_id or not freekassa_secret or freekassa_shop_id == "DECRYPTION_ERROR" or freekassa_secret == "DECRYPTION_ERROR":
+                    return jsonify({"message": "Freekassa credentials not configured"}), 500
+                
+                # Freekassa поддерживает валюты: RUB, USD, EUR, UAH, KZT
+                freekassa_currency_map = {"RUB": "RUB", "USD": "USD", "EUR": "EUR", "UAH": "UAH", "KZT": "KZT"}
+                freekassa_currency = freekassa_currency_map.get(cp_currency, "RUB")
+                
+                import hashlib
+                signature_string = f"{freekassa_shop_id}:{float(amount)}:{freekassa_secret}:{order_id}"
+                signature = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+                
+                payment_url = f"https://pay.freekassa.ru/?m={freekassa_shop_id}&oa={float(amount)}&o={order_id}&s={signature}&currency={freekassa_currency}"
+                payment_system_id = order_id
+            
+            elif payment_provider == 'telegram_stars':
+                # Telegram Stars API
+                bot_token = decrypt_key(s.telegram_bot_token) if s else None
+                if not bot_token or bot_token == "DECRYPTION_ERROR":
+                    return jsonify({"message": "Telegram Bot Token not configured"}), 500
+                
+                # Конвертируем сумму в Telegram Stars (примерно 1 USD = 100 Stars)
+                # Для других валют используем примерный курс
+                stars_amount = int(float(amount) * 100)  # Предполагаем, что суммы в USD
+                if cp_currency == 'UAH':
+                    # 1 UAH ≈ 0.027 USD, значит примерно 2.7 Stars за 1 UAH
+                    stars_amount = int(float(amount) * 2.7)
+                elif cp_currency == 'RUB':
+                    # 1 RUB ≈ 0.011 USD, значит примерно 1.1 Stars за 1 RUB
+                    stars_amount = int(float(amount) * 1.1)
+                elif cp_currency == 'USD':
+                    # 1 USD = 100 Stars (примерно)
+                    stars_amount = int(float(amount) * 100)
+                
+                # Минимальная сумма - 1 звезда
+                if stars_amount < 1:
+                    stars_amount = 1
+                
+                # Создаем инвойс через Telegram Bot API
+                invoice_payload = {
+                    "title": "Пополнение баланса StealthNET",
+                    "description": f"Пополнение баланса на сумму {float(amount):.2f} {cp_currency}",
+                    "payload": order_id,
+                    "provider_token": "",  # Пустой для Stars
+                    "currency": "XTR",  # XTR - валюта Telegram Stars
+                    "prices": [
+                        {
+                            "label": f"Пополнение баланса {float(amount):.2f} {cp_currency}",
+                            "amount": stars_amount
+                        }
+                    ]
+                }
+                
+                headers = {
+                    "Content-Type": "application/json"
+                }
+                
+                # Создаем ссылку на инвойс
+                resp = requests.post(
+                    f"https://api.telegram.org/bot{bot_token}/createInvoiceLink",
+                    json=invoice_payload,
+                    headers=headers,
+                    timeout=10
+                )
+                if resp.ok:
+                    data = resp.json()
+                    if data.get('ok'):
+                        payment_url = data.get('result')
+                        payment_system_id = order_id
+                        print(f"Telegram Stars: Invoice link created for balance topup, order_id={order_id}, user_id={user.id}, amount={amount} {cp_currency}")
+                    else:
+                        print(f"Telegram Stars Error for balance topup: {data.get('description')}")
+                else:
+                    print(f"Telegram Stars API Error: {resp.status_code} - {resp.text}")
+            
+            else:
+                return jsonify({"message": f"Неподдерживаемый способ оплаты: {payment_provider}"}), 400
+            
+            if not payment_url:
+                return jsonify({"message": "Не удалось создать платеж"}), 500
+            
+            # Создаем запись о платеже
+            currency_code_map = {"uah": "UAH", "rub": "RUB", "usd": "USD"}
+            new_p = Payment(
+                order_id=order_id,
+                user_id=user.id,
+                tariff_id=None,
+                status='PENDING',
+                amount=float(amount),
+                currency=currency_code_map.get(currency.lower(), "UAH"),
+                payment_system_id=str(payment_system_id) if payment_system_id else order_id,  # Используем order_id как fallback
+                payment_provider=payment_provider
+            )
+            db.session.add(new_p)
+            try:
+                db.session.commit()
+                print(f"Telegram Stars: Payment record created for balance topup, payment_id={new_p.id}, order_id={order_id}, user_id={user.id}, amount={float(amount)} {currency_code_map.get(currency.lower(), 'UAH')}")
+            except Exception as e:
+                print(f"Telegram Stars: Error creating payment record: {e}")
+                db.session.rollback()
+                return jsonify({"message": "Ошибка создания платежа"}), 500
+            
+            return jsonify({"payment_url": payment_url, "order_id": order_id}), 200
+        
+        # Обычная покупка тарифа
+        # 🛡️ TYPE CHECK
         if not isinstance(tid, int): return jsonify({"message": "Invalid ID"}), 400
         
         promo_code_str = request.json.get('promo_code', '').strip().upper() if request.json.get('promo_code') else None
@@ -5054,6 +6333,9 @@ def create_payment():
             payment_url = result.get('url')
             payment_system_id = result.get('uuid')
             
+            if not payment_url:
+                return jsonify({"message": "Failed to create payment"}), 500
+            
         elif payment_provider == 'telegram_stars':
             # Telegram Stars API
             bot_token = decrypt_key(s.telegram_bot_token)
@@ -5110,6 +6392,9 @@ def create_payment():
             
             payment_url = resp.get('result')
             payment_system_id = order_id  # Используем order_id как идентификатор
+            
+            if not payment_url:
+                return jsonify({"message": "Failed to create payment"}), 500
         
         elif payment_provider == 'yookassa':
             # YooKassa API
@@ -5213,8 +6498,8 @@ def create_payment():
                     "currency": info['c']
                 },
                 "description": f"Payment for order {transaction_uuid}",
-                "return": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/dashboard/subscription",
-                "failedUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/dashboard/subscription"
+                "return": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                "failedUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
             }
             
             # Заголовки согласно документации Platega API
@@ -5445,7 +6730,7 @@ def create_payment():
             
             # Добавляем checkout options с redirect URL
             checkout_options = {
-                "redirectURL": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription" if YOUR_SERVER_IP_OR_DOMAIN else "https://client.vpnborz.ru/dashboard/subscription"
+                "redirectURL": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
             }
             
             payload = {
@@ -5486,6 +6771,170 @@ def create_payment():
                     except:
                         pass
                 return jsonify({"message": f"BTCPayServer API Error: {error_msg}"}), 500
+        
+        elif payment_provider == 'tribute':
+            # Tribute API
+            tribute_api_key = decrypt_key(s.tribute_api_key) if s else None
+            
+            if not tribute_api_key or tribute_api_key == "DECRYPTION_ERROR":
+                return jsonify({"message": "Tribute API key not configured"}), 500
+            
+            # Конвертируем валюту в формат Tribute (rub, eur)
+            currency_map = {
+                'RUB': 'rub',
+                'UAH': 'rub',  # UAH не поддерживается, используем RUB
+                'USD': 'eur'   # USD не поддерживается, используем EUR
+            }
+            tribute_currency = currency_map.get(info['c'], 'rub')
+            
+            # Конвертируем сумму в минимальные единицы (копейки/центы)
+            amount_in_cents = int(final_amount * 100)
+            
+            payload = {
+                "amount": amount_in_cents,
+                "currency": tribute_currency,
+                "title": f"VPN Subscription - {t.name}"[:100],
+                "description": f"VPN subscription for {t.duration_days} days"[:300],
+                "successUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                "failUrl": f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
+            }
+            
+            if user.email:
+                payload["email"] = user.email
+            
+            order_url = "https://tribute.tg/api/v1/shop/orders"
+            
+            headers = {
+                "Content-Type": "application/json",
+                "Api-Key": tribute_api_key
+            }
+            
+            try:
+                resp = requests.post(
+                    order_url,
+                    json=payload,
+                    headers=headers,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                order_data = resp.json()
+                
+                payment_url = order_data.get('paymentUrl')
+                payment_system_id = order_data.get('uuid')
+                
+                if not payment_url:
+                    return jsonify({"message": "Failed to create payment"}), 500
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                    except:
+                        pass
+                return jsonify({"message": f"Tribute API Error: {error_msg}"}), 500
+        
+        elif payment_provider == 'robokassa':
+            # Robokassa API
+            robokassa_login = decrypt_key(s.robokassa_merchant_login) if s else None
+            robokassa_password1 = decrypt_key(s.robokassa_password1) if s else None
+            
+            if not robokassa_login or not robokassa_password1 or robokassa_login == "DECRYPTION_ERROR" or robokassa_password1 == "DECRYPTION_ERROR":
+                return jsonify({"message": "Robokassa credentials not configured"}), 500
+            
+            # Robokassa работает только с RUB
+            if info['c'] not in ['RUB', 'rub']:
+                robokassa_amount = final_amount
+            else:
+                robokassa_amount = final_amount
+            
+            description = f"VPN Subscription - {t.name} ({t.duration_days} days)"[:100]
+            
+            # Создаем MD5 подпись: MD5(MerchantLogin:OutSum:InvId:Password#1)
+            import hashlib
+            signature_string = f"{robokassa_login}:{robokassa_amount}:{order_id}:{robokassa_password1}"
+            signature = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+            
+            # Формируем URL для оплаты
+            import urllib.parse
+            params = {
+                'MerchantLogin': robokassa_login,
+                'OutSum': str(robokassa_amount),
+                'InvId': order_id,
+                'Description': description,
+                'SignatureValue': signature,
+                'SuccessURL': f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription",
+                'FailURL': f"{YOUR_SERVER_IP_OR_DOMAIN}/dashboard/subscription"
+            }
+            
+            query_string = urllib.parse.urlencode(params)
+            payment_url = f"https://auth.robokassa.ru/Merchant/Index.aspx?{query_string}"
+            payment_system_id = order_id
+        
+        elif payment_provider == 'freekassa':
+            # Freekassa API
+            freekassa_shop_id = decrypt_key(s.freekassa_shop_id) if s else None
+            freekassa_secret = decrypt_key(s.freekassa_secret) if s else None
+            
+            if not freekassa_shop_id or not freekassa_secret or freekassa_shop_id == "DECRYPTION_ERROR" or freekassa_secret == "DECRYPTION_ERROR":
+                return jsonify({"message": "Freekassa credentials not configured"}), 500
+            
+            # Freekassa поддерживает валюты: RUB, USD, EUR, UAH, KZT
+            currency_map = {
+                'RUB': 'RUB',
+                'UAH': 'UAH',
+                'USD': 'USD',
+                'EUR': 'EUR',
+                'KZT': 'KZT'
+            }
+            freekassa_currency = currency_map.get(info['c'], 'RUB')
+            
+            # Генерируем nonce
+            import time
+            nonce = int(time.time() * 1000)
+            
+            # Формируем подпись: MD5(shopId + amount + currency + paymentId + secret)
+            import hashlib
+            signature_string = f"{freekassa_shop_id}{final_amount}{freekassa_currency}{order_id}{freekassa_secret}"
+            signature = hashlib.md5(signature_string.encode('utf-8')).hexdigest()
+            
+            api_params = {
+                'shopId': freekassa_shop_id,
+                'nonce': nonce,
+                'signature': signature,
+                'paymentId': order_id,
+                'amount': str(final_amount),
+                'currency': freekassa_currency
+            }
+            
+            api_url = "https://api.fk.life/v1/orders/create"
+            
+            try:
+                resp = requests.post(
+                    api_url,
+                    params=api_params,
+                    timeout=30
+                )
+                resp.raise_for_status()
+                order_data = resp.json()
+                
+                if order_data.get('type') == 'success':
+                    payment_url = order_data.get('data', {}).get('url')
+                    payment_system_id = order_data.get('data', {}).get('orderId') or order_id
+                    
+                    if not payment_url:
+                        return jsonify({"message": "Failed to create payment"}), 500
+                else:
+                    return jsonify({"message": "Failed to create payment"}), 500
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)
+                if hasattr(e, 'response') and e.response is not None:
+                    try:
+                        error_data = e.response.json()
+                        error_msg = error_data.get('message') or error_data.get('error') or str(e)
+                    except:
+                        pass
+                return jsonify({"message": f"Freekassa API Error: {error_msg}"}), 500
         
         elif payment_provider == 'urlpay':
             # UrlPay API (аналогично Mulenpay)
@@ -5568,6 +7017,9 @@ def create_payment():
             login = decrypt_key(s.crystalpay_api_key)
             secret = decrypt_key(s.crystalpay_api_secret)
             
+            if not login or not secret or login == "DECRYPTION_ERROR" or secret == "DECRYPTION_ERROR":
+                return jsonify({"message": "CrystalPay credentials not configured"}), 500
+            
             payload = {
                 "auth_login": login, "auth_secret": secret,
                 "amount": f"{final_amount:.2f}", "type": "purchase", "currency": info['c'],
@@ -5586,6 +7038,10 @@ def create_payment():
             
             if not payment_url:
                 return jsonify({"message": "Failed to create payment"}), 500
+        
+        # Проверяем, что payment_url был установлен
+        if not payment_url:
+            return jsonify({"message": "Ошибка создания платежа"}), 500
         
         new_p = Payment(
             order_id=order_id, 
@@ -5612,7 +7068,27 @@ def crystal_webhook():
     if not p or p.status == 'PAID': return jsonify({"error": False}), 200
     
     u = db.session.get(User, p.user_id)
+    if not u: return jsonify({"error": False}), 200
+    
+    # Если это пополнение баланса (tariff_id == None)
+    if p.tariff_id is None:
+        # Пополняем баланс пользователя
+        # Конвертируем сумму пополнения в USD перед добавлением к балансу
+        current_balance_usd = float(u.balance) if u.balance else 0.0
+        amount_usd = convert_to_usd(p.amount, p.currency)
+        u.balance = current_balance_usd + amount_usd
+        p.status = 'PAID'
+        db.session.commit()
+        
+        # Очищаем кэш
+        cache.delete(f'live_data_{u.remnawave_uuid}')
+        cache.delete('all_live_users_map')
+        
+        return jsonify({"error": False}), 200
+    
+    # Обычная покупка тарифа
     t = db.session.get(Tariff, p.tariff_id)
+    if not t: return jsonify({"error": False}), 200
     
     h, c = get_remnawave_headers()
     live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
@@ -5956,7 +7432,9 @@ def telegram_webhook():
     """Webhook для обработки платежей Telegram Stars"""
     try:
         update = request.json
+        print(f"Telegram webhook received: {update}")
         if not update:
+            print("Telegram webhook: Empty update received")
             return jsonify({"ok": True}), 200
         
         # Обработка PreCheckoutQuery (подтверждение оплаты)
@@ -6022,14 +7500,54 @@ def telegram_webhook():
                 p = Payment.query.filter_by(order_id=order_id).first()
                 if not p:
                     print(f"Telegram successful payment: Payment not found for order_id={order_id}")
-                    return jsonify({"ok": True}), 200
+                    # Попробуем найти по payment_system_id (может быть использован order_id)
+                    p = Payment.query.filter_by(payment_system_id=order_id).first()
+                    if not p:
+                        print(f"Telegram successful payment: Payment not found by payment_system_id either: {order_id}")
+                        return jsonify({"ok": True}), 200
+                    else:
+                        print(f"Telegram successful payment: Found payment by payment_system_id: {p.id}, order_id={p.order_id}")
                 
                 if p.status == 'PAID':
-                    print(f"Telegram successful payment: Payment already paid for order_id={order_id}")
+                    print(f"Telegram successful payment: Payment already paid for order_id={order_id}, payment_id={p.id}")
                     return jsonify({"ok": True}), 200
                 
                 u = db.session.get(User, p.user_id)
+                if not u:
+                    print(f"Telegram successful payment: User not found for payment {p.id}, user_id={p.user_id}")
+                    return jsonify({"ok": True}), 200
+                
+                print(f"Telegram successful payment: Processing payment {p.id}, user_id={u.id}, tariff_id={p.tariff_id}, amount={p.amount}, currency={p.currency}")
+                
+                # Если это пополнение баланса (tariff_id == None)
+                if p.tariff_id is None:
+                    # Пополняем баланс пользователя
+                    # Конвертируем сумму пополнения в USD перед добавлением к балансу
+                    current_balance_usd = float(u.balance) if u.balance else 0.0
+                    amount_usd = convert_to_usd(p.amount, p.currency)
+                    new_balance = current_balance_usd + amount_usd
+                    u.balance = new_balance
+                    p.status = 'PAID'
+                    
+                    try:
+                        db.session.commit()
+                        print(f"Telegram Stars: Balance top-up successful for user {u.id} (email: {u.email}), amount: {p.amount} {p.currency} = {amount_usd} USD, old balance: {current_balance_usd}, new balance: {new_balance}")
+                    except Exception as e:
+                        print(f"Telegram Stars: Error committing balance top-up: {e}")
+                        db.session.rollback()
+                        return jsonify({"ok": True}), 200
+                    
+                    # Очищаем кэш
+                    cache.delete(f'live_data_{u.remnawave_uuid}')
+                    cache.delete('all_live_users_map')
+                    
+                    return jsonify({"ok": True}), 200
+                
+                # Обычная покупка тарифа
                 t = db.session.get(Tariff, p.tariff_id)
+                if not t:
+                    print(f"Telegram successful payment: Tariff not found for payment {p.order_id}")
+                    return jsonify({"ok": True}), 200
                 
                 h = {"Authorization": f"Bearer {ADMIN_TOKEN}"}
                 live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h).json().get('response', {})
@@ -6084,6 +7602,8 @@ def telegram_webhook():
         return jsonify({"ok": True}), 200
     except Exception as e:
         print(f"Telegram webhook error: {e}")
+        import traceback
+        traceback.print_exc()
         return jsonify({"ok": True}), 200  # Всегда возвращаем успех, чтобы Telegram не повторял запрос
 
 @app.route('/api/webhook/platega', methods=['POST'])
@@ -6479,6 +7999,368 @@ def btcpayserver_webhook():
         traceback.print_exc()
         return jsonify({"error": False}), 200  # Возвращаем успех, чтобы BTCPayServer не повторял запрос
 
+@app.route('/api/webhook/tribute', methods=['POST'])
+def tribute_webhook():
+    """
+    Webhook для обработки уведомлений от Tribute
+    
+    Tribute может отправлять уведомления о статусе заказа.
+    Также можно проверять статус через API: GET /api/v1/shop/orders/{orderUuid}/status
+    """
+    try:
+        webhook_data = request.json
+        if not webhook_data:
+            return jsonify({}), 200
+        
+        # Tribute может отправлять UUID заказа или данные о заказе
+        order_uuid = webhook_data.get('uuid') or webhook_data.get('orderUuid')
+        status = webhook_data.get('status', '').lower()
+        
+        if not order_uuid:
+            print("Tribute webhook: order UUID not found")
+            return jsonify({}), 200
+        
+        # Ищем платеж по payment_system_id (UUID заказа)
+        p = Payment.query.filter_by(payment_system_id=order_uuid).first()
+        if not p:
+            print(f"Tribute webhook: Payment not found for UUID {order_uuid}")
+            return jsonify({}), 200
+        
+        # Если платеж уже обработан, игнорируем
+        if p.status == 'PAID':
+            return jsonify({}), 200
+        
+        # Если статус не указан в webhook, проверяем через API
+        if not status or status not in ['paid', 'success', 'completed']:
+            # Проверяем статус через API Tribute
+            s = PaymentSetting.query.first()
+            if not s:
+                return jsonify({}), 200
+            
+            tribute_api_key = decrypt_key(s.tribute_api_key) if s.tribute_api_key else None
+            if not tribute_api_key or tribute_api_key == "DECRYPTION_ERROR":
+                return jsonify({}), 200
+            
+            try:
+                status_url = f"https://tribute.tg/api/v1/shop/orders/{order_uuid}/status"
+                headers = {"Api-Key": tribute_api_key}
+                status_resp = requests.get(status_url, headers=headers, timeout=10)
+                
+                if status_resp.ok:
+                    status_data = status_resp.json()
+                    status = status_data.get('status', '').lower()
+                else:
+                    return jsonify({}), 200
+            except:
+                return jsonify({}), 200
+        
+        # Обрабатываем только успешные платежи
+        if status in ['paid', 'success', 'completed']:
+            u = db.session.get(User, p.user_id)
+            t = db.session.get(Tariff, p.tariff_id)
+            
+            if not u or not t:
+                print(f"Tribute webhook: User or Tariff not found for payment {p.order_id}")
+                return jsonify({}), 200
+            
+            h, c = get_remnawave_headers()
+            live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
+            curr_exp = parse_iso_datetime(live.get('expireAt'))
+            new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
+            
+            # Используем сквад из тарифа, если указан, иначе дефолтный
+            squad_id = t.squad_id if t.squad_id else DEFAULT_SQUAD_ID
+            
+            # Формируем payload для обновления пользователя
+            patch_payload = {
+                "uuid": u.remnawave_uuid,
+                "expireAt": new_exp.isoformat(),
+                "activeInternalSquads": [squad_id]
+            }
+            
+            # Добавляем лимит трафика, если указан в тарифе
+            if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
+                patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
+                patch_payload["trafficLimitStrategy"] = "NO_RESET"
+            
+            h, c = get_remnawave_headers({"Content-Type": "application/json"})
+            patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
+            if not patch_resp.ok:
+                print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+                return jsonify({}), 200
+            
+            # Списываем использование промокода, если он был использован
+            if p.promo_code_id:
+                promo = db.session.get(PromoCode, p.promo_code_id)
+                if promo and promo.uses_left > 0:
+                    promo.uses_left -= 1
+            
+            p.status = 'PAID'
+            db.session.commit()
+            cache.delete(f'live_data_{u.remnawave_uuid}')
+            cache.delete(f'nodes_{u.remnawave_uuid}')
+            
+            # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+            if BOT_API_URL and BOT_API_TOKEN:
+                app_context = app.app_context()
+                import threading
+                sync_thread = threading.Thread(
+                    target=sync_subscription_to_bot_in_background,
+                    args=(app_context, u.remnawave_uuid),
+                    daemon=True
+                )
+                sync_thread.start()
+                print(f"Started background sync thread for user {u.remnawave_uuid}")
+        
+        return jsonify({}), 200
+    except Exception as e:
+        print(f"Error in tribute_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({}), 200  # Возвращаем успех, чтобы Tribute не повторял запрос
+
+@app.route('/api/webhook/robokassa', methods=['POST'])
+def robokassa_webhook():
+    """
+    Webhook для обработки уведомлений от Robokassa (ResultURL)
+    
+    Robokassa отправляет POST запрос с параметрами:
+    - OutSum - сумма платежа
+    - InvId - номер счета (order_id)
+    - SignatureValue - подпись для проверки
+    
+    Формула проверки подписи: MD5(OutSum:InvId:Password#2)
+    
+    В настройках магазина Robokassa нужно указать ResultURL:
+    {YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/robokassa
+    """
+    try:
+        # Robokassa отправляет данные через POST (form-data или query string)
+        # Пробуем получить из form или args
+        out_sum = request.form.get('OutSum') or request.args.get('OutSum')
+        inv_id = request.form.get('InvId') or request.args.get('InvId')
+        signature = request.form.get('SignatureValue') or request.args.get('SignatureValue')
+        
+        if not out_sum or not inv_id or not signature:
+            print("Robokassa webhook: Missing required parameters")
+            return "OK", 200  # Robokassa требует ответ "OK" в случае ошибки
+        
+        # Получаем настройки для проверки подписи
+        s = PaymentSetting.query.first()
+        if not s:
+            return "OK", 200
+        
+        robokassa_password2 = decrypt_key(s.robokassa_password2) if s.robokassa_password2 else None
+        if not robokassa_password2 or robokassa_password2 == "DECRYPTION_ERROR":
+            print("Robokassa webhook: Password #2 not configured")
+            return "OK", 200
+        
+        # Проверяем подпись: MD5(OutSum:InvId:Password#2)
+        import hashlib
+        expected_signature = hashlib.md5(f"{out_sum}:{inv_id}:{robokassa_password2}".encode('utf-8')).hexdigest()
+        
+        if signature.lower() != expected_signature.lower():
+            print(f"Robokassa webhook: Invalid signature. Expected: {expected_signature}, Got: {signature}")
+            return "OK", 200
+        
+        # Ищем платеж по order_id (InvId)
+        p = Payment.query.filter_by(order_id=inv_id).first()
+        if not p:
+            print(f"Robokassa webhook: Payment not found for InvId {inv_id}")
+            return "OK", 200
+        
+        # Если платеж уже обработан, игнорируем
+        if p.status == 'PAID':
+            return "OK", 200
+        
+        u = db.session.get(User, p.user_id)
+        t = db.session.get(Tariff, p.tariff_id)
+        
+        if not u or not t:
+            print(f"Robokassa webhook: User or Tariff not found for payment {p.order_id}")
+            return "OK", 200
+        
+        h, c = get_remnawave_headers()
+        live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
+        curr_exp = parse_iso_datetime(live.get('expireAt'))
+        new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
+        
+        # Используем сквад из тарифа, если указан, иначе дефолтный
+        squad_id = t.squad_id if t.squad_id else DEFAULT_SQUAD_ID
+        
+        # Формируем payload для обновления пользователя
+        patch_payload = {
+            "uuid": u.remnawave_uuid,
+            "expireAt": new_exp.isoformat(),
+            "activeInternalSquads": [squad_id]
+        }
+        
+        # Добавляем лимит трафика, если указан в тарифе
+        if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
+            patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
+            patch_payload["trafficLimitStrategy"] = "NO_RESET"
+        
+        h, c = get_remnawave_headers({"Content-Type": "application/json"})
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
+        if not patch_resp.ok:
+            print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+            return "OK", 200
+        
+        # Списываем использование промокода, если он был использован
+        if p.promo_code_id:
+            promo = db.session.get(PromoCode, p.promo_code_id)
+            if promo and promo.uses_left > 0:
+                promo.uses_left -= 1
+        
+        p.status = 'PAID'
+        db.session.commit()
+        cache.delete(f'live_data_{u.remnawave_uuid}')
+        cache.delete(f'nodes_{u.remnawave_uuid}')
+        
+        # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+        if BOT_API_URL and BOT_API_TOKEN:
+            app_context = app.app_context()
+            import threading
+            sync_thread = threading.Thread(
+                target=sync_subscription_to_bot_in_background,
+                args=(app_context, u.remnawave_uuid),
+                daemon=True
+            )
+            sync_thread.start()
+            print(f"Started background sync thread for user {u.remnawave_uuid}")
+        
+        # Robokassa требует ответ "OK" при успешной обработке
+        return "OK", 200
+    except Exception as e:
+        print(f"Error in robokassa_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        return "OK", 200  # Всегда возвращаем "OK", чтобы Robokassa не повторял запрос
+
+@app.route('/api/webhook/freekassa', methods=['GET', 'POST'])
+def freekassa_webhook():
+    """
+    Webhook для обработки уведомлений от Freekassa (Result URL)
+    
+    Freekassa отправляет данные на URL оповещения с параметрами:
+    - MERCHANT_ID - ID магазина
+    - AMOUNT - сумма платежа
+    - MERCHANT_ORDER_ID - номер заказа (paymentId)
+    - P_EMAIL - email плательщика (опционально)
+    - P_PHONE - телефон плательщика (опционально)
+    - SIGN - подпись для проверки
+    
+    Формула проверки подписи: MD5(AMOUNT + MERCHANT_ORDER_ID + Secret2)
+    
+    В настройках магазина Freekassa нужно указать URL оповещения:
+    {YOUR_SERVER_IP_OR_DOMAIN}/api/webhook/freekassa
+    
+    Для подтверждения получения уведомления нужно вернуть "YES"
+    """
+    try:
+        # Freekassa может отправлять данные через GET или POST
+        # Пробуем получить из form, args или json
+        merchant_id = request.form.get('MERCHANT_ID') or request.args.get('MERCHANT_ID')
+        amount = request.form.get('AMOUNT') or request.args.get('AMOUNT')
+        merchant_order_id = request.form.get('MERCHANT_ORDER_ID') or request.args.get('MERCHANT_ORDER_ID')
+        sign = request.form.get('SIGN') or request.args.get('SIGN')
+        
+        if not merchant_id or not amount or not merchant_order_id or not sign:
+            print("Freekassa webhook: Missing required parameters")
+            return "YES", 200  # Freekassa требует ответ "YES" даже при ошибке
+        
+        # Получаем настройки для проверки подписи
+        s = PaymentSetting.query.first()
+        if not s:
+            return "YES", 200
+        
+        freekassa_secret2 = decrypt_key(s.freekassa_secret2) if s.freekassa_secret2 else None
+        if not freekassa_secret2 or freekassa_secret2 == "DECRYPTION_ERROR":
+            print("Freekassa webhook: Secret2 not configured")
+            return "YES", 200
+        
+        # Проверяем подпись: MD5(AMOUNT + MERCHANT_ORDER_ID + Secret2)
+        import hashlib
+        expected_signature = hashlib.md5(f"{amount}{merchant_order_id}{freekassa_secret2}".encode('utf-8')).hexdigest()
+        
+        if sign.upper() != expected_signature.upper():
+            print(f"Freekassa webhook: Invalid signature. Expected: {expected_signature.upper()}, Got: {sign.upper()}")
+            return "YES", 200
+        
+        # Ищем платеж по order_id (MERCHANT_ORDER_ID)
+        p = Payment.query.filter_by(order_id=merchant_order_id).first()
+        if not p:
+            print(f"Freekassa webhook: Payment not found for MERCHANT_ORDER_ID {merchant_order_id}")
+            return "YES", 200
+        
+        # Если платеж уже обработан, игнорируем
+        if p.status == 'PAID':
+            return "YES", 200
+        
+        u = db.session.get(User, p.user_id)
+        t = db.session.get(Tariff, p.tariff_id)
+        
+        if not u or not t:
+            print(f"Freekassa webhook: User or Tariff not found for payment {p.order_id}")
+            return "YES", 200
+        
+        h, c = get_remnawave_headers()
+        live = requests.get(f"{API_URL}/api/users/{u.remnawave_uuid}", headers=h, cookies=c).json().get('response', {})
+        curr_exp = parse_iso_datetime(live.get('expireAt'))
+        new_exp = max(datetime.now(timezone.utc), curr_exp) + timedelta(days=t.duration_days)
+        
+        # Используем сквад из тарифа, если указан, иначе дефолтный
+        squad_id = t.squad_id if t.squad_id else DEFAULT_SQUAD_ID
+        
+        # Формируем payload для обновления пользователя
+        patch_payload = {
+            "uuid": u.remnawave_uuid,
+            "expireAt": new_exp.isoformat(),
+            "activeInternalSquads": [squad_id]
+        }
+        
+        # Добавляем лимит трафика, если указан в тарифе
+        if t.traffic_limit_bytes and t.traffic_limit_bytes > 0:
+            patch_payload["trafficLimitBytes"] = t.traffic_limit_bytes
+            patch_payload["trafficLimitStrategy"] = "NO_RESET"
+        
+        h, c = get_remnawave_headers({"Content-Type": "application/json"})
+        patch_resp = requests.patch(f"{API_URL}/api/users", headers=h, cookies=c, json=patch_payload)
+        if not patch_resp.ok:
+            print(f"⚠️ Failed to update user in RemnaWave: Status {patch_resp.status_code}")
+            return "YES", 200
+        
+        # Списываем использование промокода, если он был использован
+        if p.promo_code_id:
+            promo = db.session.get(PromoCode, p.promo_code_id)
+            if promo and promo.uses_left > 0:
+                promo.uses_left -= 1
+        
+        p.status = 'PAID'
+        db.session.commit()
+        cache.delete(f'live_data_{u.remnawave_uuid}')
+        cache.delete(f'nodes_{u.remnawave_uuid}')
+        
+        # Синхронизируем обновленную подписку из RemnaWave в бота в фоновом режиме
+        if BOT_API_URL and BOT_API_TOKEN:
+            app_context = app.app_context()
+            import threading
+            sync_thread = threading.Thread(
+                target=sync_subscription_to_bot_in_background,
+                args=(app_context, u.remnawave_uuid),
+                daemon=True
+            )
+            sync_thread.start()
+            print(f"Started background sync thread for user {u.remnawave_uuid}")
+        
+        # Freekassa требует ответ "YES" при успешной обработке
+        return "YES", 200
+    except Exception as e:
+        print(f"Error in freekassa_webhook: {e}")
+        import traceback
+        traceback.print_exc()
+        return "YES", 200  # Всегда возвращаем "YES", чтобы Freekassa не повторял запрос
+
 @app.route('/api/webhook/monobank', methods=['POST'])
 def monobank_webhook():
     """Webhook для обработки уведомлений от Monobank"""
@@ -6654,7 +8536,7 @@ def get_sales(current_admin):
         limit = request.args.get('limit', type=int) or 50
         offset = request.args.get('offset', type=int) or 0
         
-        # Получаем платежи с информацией о пользователе и тарифе
+        # Получаем платежи с информацией о пользователе и тарифе (включая пополнения баланса)
         payments = db.session.query(
             Payment,
             User,
@@ -6662,7 +8544,7 @@ def get_sales(current_admin):
             PromoCode
         ).join(
             User, Payment.user_id == User.id
-        ).join(
+        ).outerjoin(
             Tariff, Payment.tariff_id == Tariff.id
         ).outerjoin(
             PromoCode, Payment.promo_code_id == PromoCode.id
@@ -6674,27 +8556,50 @@ def get_sales(current_admin):
         
         sales_list = []
         for payment, user, tariff, promo in payments:
-            sales_list.append({
-                "id": payment.id,
-                "order_id": payment.order_id,
-                "date": payment.created_at.isoformat() if payment.created_at else None,
-                "amount": payment.amount,
-                "currency": payment.currency,
-                "status": payment.status,
-                "payment_provider": payment.payment_provider or 'crystalpay',
-                "user": {
-                    "id": user.id,
-                    "email": user.email,
-                    "telegram_id": user.telegram_id,
-                    "telegram_username": user.telegram_username
-                },
-                "tariff": {
-                    "id": tariff.id,
-                    "name": tariff.name,
-                    "duration_days": tariff.duration_days
-                },
-                "promo_code": promo.code if promo else None
-            })
+            # Если это пополнение баланса (tariff_id == None)
+            if payment.tariff_id is None:
+                sales_list.append({
+                    "id": payment.id,
+                    "order_id": payment.order_id,
+                    "date": payment.created_at.isoformat() if payment.created_at else None,
+                    "amount": payment.amount,
+                    "currency": payment.currency,
+                    "status": payment.status,
+                    "payment_provider": payment.payment_provider or 'crystalpay',
+                    "user": {
+                        "id": user.id,
+                        "email": user.email,
+                        "telegram_id": user.telegram_id,
+                        "telegram_username": user.telegram_username
+                    },
+                    "tariff": None,  # Пополнение баланса
+                    "is_balance_topup": True,  # Флаг пополнения баланса
+                    "promo_code": promo.code if promo else None
+                })
+            else:
+                # Обычная покупка тарифа
+                sales_list.append({
+                    "id": payment.id,
+                    "order_id": payment.order_id,
+                    "date": payment.created_at.isoformat() if payment.created_at else None,
+                    "amount": payment.amount,
+                    "currency": payment.currency,
+                    "status": payment.status,
+                    "payment_provider": payment.payment_provider or 'crystalpay',
+                    "user": {
+                        "id": user.id,
+                        "email": user.email,
+                        "telegram_id": user.telegram_id,
+                        "telegram_username": user.telegram_username
+                    },
+                    "tariff": {
+                        "id": tariff.id,
+                        "name": tariff.name,
+                        "duration_days": tariff.duration_days
+                    },
+                    "is_balance_topup": False,
+                    "promo_code": promo.code if promo else None
+                })
         
         return jsonify(sales_list), 200
     except Exception as e:
@@ -7225,6 +9130,27 @@ def init_database():
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='system_setting'")
         system_table_exists = cursor.fetchone() is not None
         
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='currency_rate'")
+        currency_rate_table_exists = cursor.fetchone() is not None
+        
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='user'")
+        user_table_exists = cursor.fetchone() is not None
+        
+        # Проверяем и добавляем поле balance в таблицу user, если его нет
+        if user_table_exists:
+            cursor.execute("PRAGMA table_info(user)")
+            user_columns = [col[1] for col in cursor.fetchall()]
+            if 'balance' not in user_columns:
+                print("⚠️  Добавление колонки balance в user...")
+                try:
+                    cursor.execute("ALTER TABLE user ADD COLUMN balance REAL NOT NULL DEFAULT 0.0")
+                    cursor.execute("UPDATE user SET balance = 0.0 WHERE balance IS NULL")
+                    conn.commit()
+                    print("✓ Колонка balance добавлена в user")
+                except Exception as e:
+                    print(f"⚠️  Ошибка при добавлении колонки balance: {e}")
+                    conn.rollback()
+        
         # Если таблица payment_setting не существует, создаем её явно
         if not payment_table_exists:
             print("⚠️  Таблица payment_setting не найдена, создаем её...")
@@ -7250,7 +9176,14 @@ def init_database():
                     monobank_token TEXT,
                     btcpayserver_url TEXT,
                     btcpayserver_api_key TEXT,
-                    btcpayserver_store_id TEXT
+                    btcpayserver_store_id TEXT,
+                    tribute_api_key TEXT,
+                    robokassa_merchant_login TEXT,
+                    robokassa_password1 TEXT,
+                    robokassa_password2 TEXT,
+                    freekassa_shop_id TEXT,
+                    freekassa_secret TEXT,
+                    freekassa_secret2 TEXT
                 )
             """)
             conn.commit()
@@ -7268,7 +9201,10 @@ def init_database():
                 'mulenpay_api_key', 'mulenpay_secret_key', 'mulenpay_shop_id', 
                 'urlpay_api_key', 'urlpay_secret_key', 'urlpay_shop_id', 
                 'monobank_token',
-                'btcpayserver_url', 'btcpayserver_api_key', 'btcpayserver_store_id'
+                'btcpayserver_url', 'btcpayserver_api_key', 'btcpayserver_store_id',
+                'tribute_api_key',
+                'robokassa_merchant_login', 'robokassa_password1', 'robokassa_password2',
+                'freekassa_shop_id', 'freekassa_secret', 'freekassa_secret2'
             ]
             
             # Проверяем, какие колонки отсутствуют
@@ -7293,7 +9229,14 @@ def init_database():
                     'monobank_token': 'TEXT',
                     'btcpayserver_url': 'TEXT',
                     'btcpayserver_api_key': 'TEXT',
-                    'btcpayserver_store_id': 'TEXT'
+                    'btcpayserver_store_id': 'TEXT',
+                    'tribute_api_key': 'TEXT',
+                    'robokassa_merchant_login': 'TEXT',
+                    'robokassa_password1': 'TEXT',
+                    'robokassa_password2': 'TEXT',
+                    'freekassa_shop_id': 'TEXT',
+                    'freekassa_secret': 'TEXT',
+                    'freekassa_secret2': 'TEXT'
                 }
                 
                 # Добавляем каждую недостающую колонку
@@ -7349,6 +9292,20 @@ def init_database():
                 except Exception as e:
                     print(f"⚠️  Ошибка при добавлении колонки: {e}")
                     conn.rollback()
+        
+        # Если таблица currency_rate не существует, создаем её явно
+        if not currency_rate_table_exists:
+            print("⚠️  Таблица currency_rate не найдена, создаем её...")
+            cursor.execute("""
+                CREATE TABLE currency_rate (
+                    id INTEGER PRIMARY KEY,
+                    currency VARCHAR(10) NOT NULL UNIQUE,
+                    rate_to_usd REAL NOT NULL,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            conn.commit()
+            print("✓ Таблица currency_rate создана")
         
         conn.close()
     except Exception as e:
@@ -7704,7 +9661,8 @@ def miniapp_root_post():
                                 'preferred_lang': user.preferred_lang,
                                 'preferred_currency': user.preferred_currency,
                                 'telegram_id': user.telegram_id,
-                                'telegram_username': user.telegram_username
+                                'telegram_username': user.telegram_username,
+                                'balance': convert_from_usd(float(user.balance) if user.balance else 0.0, user.preferred_currency)
                             })
                             return jsonify(response_data), 200
                         
@@ -7740,7 +9698,8 @@ def miniapp_root_post():
                                     'preferred_lang': user.preferred_lang,
                                     'preferred_currency': user.preferred_currency,
                                     'telegram_id': user.telegram_id,
-                                    'telegram_username': user.telegram_username
+                                    'telegram_username': user.telegram_username,
+                                    'balance': convert_from_usd(float(user.balance) if user.balance else 0.0, user.preferred_currency)
                                 })
                             
                             cache.set(cache_key, result_data, timeout=300)
@@ -7998,7 +9957,8 @@ def miniapp_root_post():
                     'preferred_lang': user.preferred_lang,
                     'preferred_currency': user.preferred_currency,
                     'telegram_id': user.telegram_id,
-                    'telegram_username': user.telegram_username
+                    'telegram_username': user.telegram_username,
+                    'balance': convert_from_usd(float(user.balance) if user.balance else 0.0, user.preferred_currency)
                 })
             
             # Кэшируем на 5 минут
@@ -8099,4 +10059,5 @@ def miniapp_static(path):
 if __name__ == '__main__':
     with app.app_context():
         init_database()
+    app.run(port=5000, debug=False)
     app.run(port=5000, debug=False)

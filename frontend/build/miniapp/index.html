@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="ru">
+<html lang="ru" data-theme="dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
@@ -745,7 +745,40 @@
             <div id="loadingText">Загрузка...</div>
         </div>
 
-        <div id="content" class="hidden">
+        <div id="content" class="hidden" style="position: relative;">
+            <!-- Переключатель темы -->
+            <div style="position: absolute; top: 16px; right: 16px; z-index: 1000;">
+                <button 
+                    id="themeToggle" 
+                    onclick="toggleTheme()"
+                    style="
+                        width: 48px;
+                        height: 48px;
+                        border-radius: 50%;
+                        border: 1px solid var(--glass-border);
+                        background: var(--glass-bg);
+                        backdrop-filter: var(--glass-blur);
+                        -webkit-backdrop-filter: var(--glass-blur);
+                        color: var(--text-primary);
+                        font-size: 22px;
+                        cursor: pointer;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        box-shadow: var(--shadow-md);
+                        transition: all 0.3s ease;
+                        padding: 0;
+                        outline: none;
+                    "
+                    onmouseover="this.style.transform='scale(1.1)'; this.style.boxShadow='var(--shadow-lg)'; this.style.borderColor='var(--primary)'"
+                    onmouseout="this.style.transform='scale(1)'; this.style.boxShadow='var(--shadow-md)'; this.style.borderColor='var(--glass-border)'"
+                    onmousedown="this.style.transform='scale(0.95)'"
+                    onmouseup="this.style.transform='scale(1.1)'"
+                >
+                    ☀️
+                </button>
+            </div>
+            
             <!-- Брендинг -->
             <div id="brandingHeader" class="branding-header hidden">
                 <img id="brandingLogo" class="branding-logo" src="" alt="" style="display: none;">
@@ -775,10 +808,48 @@
                             <span class="info-label">📊 <span id="trafficLabel">Трафик:</span></span>
                             <span id="traffic" class="info-value">-</span>
                         </div>
+                        <div class="info-item modern">
+                            <span class="info-label">💰 <span id="balanceLabel">Баланс:</span></span>
+                            <span id="userBalance" class="info-value" style="font-weight: bold; color: var(--accent-green);">-</span>
+                        </div>
+                    </div>
+                    <div id="connectButtonContainer" style="margin-top: 18px; display: none;">
+                        <button id="connectButton" class="btn" onclick="handleConnectClick(event)" style="width: 100%;">
+                            🚀 <span id="connectButtonText">Подключиться</span>
+                        </button>
                     </div>
                     <div id="trafficProgress" class="progress-bar hidden" style="margin-top: 18px;">
                         <div id="trafficProgressFill" class="progress-fill" style="width: 0%"></div>
                     </div>
+                </div>
+
+                <!-- Пополнение баланса -->
+                <div class="card glass-card info-card accent-card">
+                    <h3 class="client-widget-title">💰 Пополнение баланса</h3>
+                    <div style="margin-bottom: 15px; padding: 15px; background: var(--bg-secondary); border-radius: 8px;">
+                        <p style="margin: 0 0 5px 0; font-size: 14px; color: var(--text-secondary);">Текущий баланс</p>
+                        <p id="balanceDisplay" style="margin: 0; font-size: 24px; font-weight: bold; color: var(--accent-green);">0.00</p>
+                    </div>
+                    <form id="balanceTopupForm" onsubmit="handleBalanceTopup(event)">
+                        <div style="margin-bottom: 15px;">
+                            <label style="display: block; margin-bottom: 8px; font-size: 14px; color: var(--text-secondary);">
+                                Сумма пополнения
+                            </label>
+                            <input
+                                type="number"
+                                step="0.01"
+                                min="0.01"
+                                id="balanceAmount"
+                                placeholder="Введите сумму"
+                                required
+                                style="width: 100%; padding: 12px; border-radius: 8px; border: 1px solid var(--glass-border); background: var(--bg-secondary); color: var(--text-primary); font-size: 16px;"
+                            />
+                        </div>
+                        <button type="submit" class="btn btn-primary" style="width: 100%;" id="balanceTopupBtn">
+                            💳 Пополнить баланс
+                        </button>
+                        <div id="balanceTopupStatus" style="margin-top: 15px; font-size: 14px;"></div>
+                    </form>
                 </div>
 
                 <!-- Данные для входа -->
@@ -1049,8 +1120,9 @@
         let appliedPromo = null; // Примененный промокод для тарифов
         let tickets = []; // Список тикетов
         let serverDomain = 'panel.stealthnet.app'; // Домен сервера для рефералки
-        let currentCurrency = 'uah'; // Текущая валюта
-        let currentLanguage = 'ru'; // Текущий язык
+        // Загружаем валюту из localStorage или используем дефолтную
+        let currentCurrency = localStorage.getItem('preferredCurrency') || 'uah';
+        let currentLanguage = localStorage.getItem('preferredLanguage') || 'ru';
 
         // Переводы
         const translations = {
@@ -1098,6 +1170,9 @@
                 message: 'Сообщение',
                 send: 'Отправить',
                 connect: 'Подключиться',
+                registrationRequired: 'Требуется регистрация',
+                registrationMessage: 'Для использования мини-приложения необходимо зарегистрироваться в боте. Пожалуйста, откройте бота и пройдите регистрацию.',
+                openBot: 'Открыть бота',
                 error: 'Ошибка',
                 errorLoading: 'Ошибка загрузки данных',
                 errorLoadingServers: 'Ошибка загрузки серверов',
@@ -1176,6 +1251,9 @@
                 message: 'Повідомлення',
                 send: 'Відправити',
                 connect: 'Підключитися',
+                registrationRequired: 'Потрібна реєстрація',
+                registrationMessage: 'Для використання міні-додатку необхідно зареєструватися в боті. Будь ласка, відкрийте бота та пройдіть реєстрацію.',
+                openBot: 'Відкрити бота',
                 error: 'Помилка',
                 errorLoading: 'Помилка завантаження даних',
                 errorLoadingServers: 'Помилка завантаження серверів',
@@ -1254,6 +1332,9 @@
                 message: 'Message',
                 send: 'Send',
                 connect: 'Connect',
+                registrationRequired: 'Registration Required',
+                registrationMessage: 'To use the mini app, you need to register in the bot. Please open the bot and complete registration.',
+                openBot: 'Open Bot',
                 error: 'Error',
                 errorLoading: 'Error loading data',
                 errorLoadingServers: 'Error loading servers',
@@ -1332,6 +1413,9 @@
                 message: '消息',
                 send: '发送',
                 connect: '连接',
+                registrationRequired: '需要注册',
+                registrationMessage: '要使用迷你应用程序，您需要在机器人中注册。请打开机器人并完成注册。',
+                openBot: '打开机器人',
                 error: '错误',
                 errorLoading: '加载数据错误',
                 errorLoadingServers: '加载服务器错误',
@@ -1475,9 +1559,41 @@
             }
         }
 
-        // Определение темы
-        if (tg.colorScheme === 'dark') {
-            document.documentElement.setAttribute('data-theme', 'dark');
+        // Определение темы (темная тема по умолчанию)
+        let currentTheme = localStorage.getItem('preferredTheme') || 'dark';
+        
+        // Устанавливаем тему при загрузке
+        function setTheme(theme) {
+            currentTheme = theme;
+            document.documentElement.setAttribute('data-theme', theme);
+            localStorage.setItem('preferredTheme', theme);
+            updateThemeToggle();
+        }
+        
+        // Инициализация темы
+        setTheme(currentTheme);
+        
+        // Функция переключения темы
+        function toggleTheme() {
+            const newTheme = currentTheme === 'dark' ? 'light' : 'dark';
+            setTheme(newTheme);
+        }
+        
+        // Обновление иконки переключателя темы
+        function updateThemeToggle() {
+            const themeToggle = document.getElementById('themeToggle');
+            if (themeToggle) {
+                // В темной теме показываем солнце (для переключения на светлую)
+                // В светлой теме показываем луну (для переключения на темную)
+                themeToggle.innerHTML = currentTheme === 'dark' ? '☀️' : '🌙';
+                
+                // Подсказка показывает, на какую тему можно переключиться
+                const tooltip = currentTheme === 'dark' 
+                    ? 'Переключить на светлую тему' 
+                    : 'Переключить на темную тему';
+                themeToggle.setAttribute('title', tooltip);
+                themeToggle.setAttribute('aria-label', tooltip);
+            }
         }
 
         // Загрузка брендинга
@@ -1583,16 +1699,27 @@
         }
 
         function updateFloatingButton() {
-            const floatingBtn = document.getElementById('floatingConnectBtn');
-            if (!floatingBtn) return;
+            // Обновляем кнопку подключения в блоке статуса подписки
+            const connectBtnContainer = document.getElementById('connectButtonContainer');
+            const connectBtn = document.getElementById('connectButton');
+            const connectBtnText = document.getElementById('connectButtonText');
+            
+            if (!connectBtnContainer || !connectBtn || !connectBtnText) return;
 
             // Показываем кнопку только на странице "Информация"
             const isOnInfoPage = currentPage === 'info';
             const isActive = userData && userData.activeInternalSquads && userData.activeInternalSquads.length > 0;
             
             if (isOnInfoPage && isActive && userData.subscriptionUrl) {
-                floatingBtn.classList.remove('hidden');
+                connectBtnContainer.style.display = 'block';
+                connectBtnText.textContent = t('connect');
             } else {
+                connectBtnContainer.style.display = 'none';
+            }
+            
+            // Скрываем старую плавающую кнопку
+            const floatingBtn = document.getElementById('floatingConnectBtn');
+            if (floatingBtn) {
                 floatingBtn.classList.add('hidden');
             }
         }
@@ -1616,11 +1743,23 @@
                 });
 
                 if (!subscriptionResponse.ok) {
+                    // Проверяем, может быть пользователь не зарегистрирован (401 или 404)
+                    if (subscriptionResponse.status === 401 || subscriptionResponse.status === 404) {
+                        showRegistrationMessage();
+                        return;
+                    }
                     throw new Error(t('errorLoadingSubscription'));
                 }
 
                 const subscriptionData = await subscriptionResponse.json();
                 userData = subscriptionData.response || subscriptionData;
+                
+                // Проверяем, зарегистрирован ли пользователь
+                if (!userData || (!userData.telegram_id && !userData.id)) {
+                    // Пользователь не зарегистрирован
+                    showRegistrationMessage();
+                    return;
+                }
                 
                 console.log('Loaded userData:', userData);
                 console.log('referral_code in userData:', userData?.referral_code);
@@ -1681,9 +1820,30 @@
                     document.documentElement.lang = currentLanguage;
                 }
                 
+                // Устанавливаем валюту из данных пользователя (приоритет: данные пользователя > localStorage > дефолт)
+                if (userData?.preferred_currency) {
+                    currentCurrency = userData.preferred_currency;
+                    // Сохраняем в localStorage для следующего открытия
+                    localStorage.setItem('preferredCurrency', currentCurrency);
+                } else if (localStorage.getItem('preferredCurrency')) {
+                    // Если в данных пользователя нет валюты, используем из localStorage
+                    currentCurrency = localStorage.getItem('preferredCurrency');
+                }
+                
                 updateSubscriptionInfo();
                 updateFloatingButton();
                 updateLanguageUI();
+                
+                // Обновляем кнопку подключения после обновления информации о подписке
+                setTimeout(() => {
+                    updateFloatingButton();
+                }, 100);
+                
+                // Обновляем настройки валюты и языка после загрузки данных
+                // Используем setTimeout, чтобы убедиться, что DOM элементы уже созданы
+                setTimeout(() => {
+                    updateSettingsUI();
+                }, 100);
                 
                 // Обновляем реферальную ссылку после загрузки данных
                 // Ждем немного, чтобы serverDomain успел загрузиться
@@ -1720,6 +1880,19 @@
                     const paymentData = await paymentMethodsResponse.json();
                     paymentMethods = paymentData.methods || [];
                 }
+                
+                // Загружаем курсы валют
+                try {
+                    const currencyRatesResponse = await fetch('/api/public/currency-rates');
+                    if (currencyRatesResponse.ok) {
+                        const ratesData = await currencyRatesResponse.json();
+                        // API возвращает {rates: {UAH: 40.0, RUB: 100.0, USD: 1.0}}
+                        // Сохраняем весь объект ответа для правильной обработки
+                        localStorage.setItem('currencyRates', JSON.stringify(ratesData));
+                    }
+                } catch (error) {
+                    console.error('Ошибка загрузки курсов валют:', error);
+                }
 
                 document.getElementById('loading').classList.add('hidden');
                 document.getElementById('content').classList.remove('hidden');
@@ -1731,8 +1904,38 @@
                 }
             } catch (error) {
                 console.error('Ошибка загрузки данных:', error);
-                document.getElementById('loading').classList.add('hidden');
-                document.getElementById('error').classList.remove('hidden');
+                // Проверяем, может быть пользователь не зарегистрирован
+                if (error.message && (error.message.includes('401') || error.message.includes('Unauthorized') || error.message.includes('не зарегистрирован'))) {
+                    showRegistrationMessage();
+                } else {
+                    document.getElementById('loading').classList.add('hidden');
+                    document.getElementById('error').classList.remove('hidden');
+                }
+            }
+        }
+        
+        function showRegistrationMessage() {
+            // Скрываем контент и показываем сообщение о регистрации
+            const content = document.getElementById('content');
+            const loading = document.getElementById('loading');
+            
+            if (loading) loading.classList.add('hidden');
+            if (content) {
+                content.classList.remove('hidden');
+                content.innerHTML = `
+                    <div style="display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 60vh; padding: 20px; text-align: center;">
+                        <div class="card glass-card" style="max-width: 400px; width: 100%;">
+                            <div style="font-size: 64px; margin-bottom: 20px;">🔐</div>
+                            <h2 style="margin-bottom: 16px; color: var(--text-primary);">${t('registrationRequired')}</h2>
+                            <p style="color: var(--text-secondary); margin-bottom: 24px; line-height: 1.6;">
+                                ${t('registrationMessage')}
+                            </p>
+                            <button class="btn" onclick="window.open('https://t.me/stealthnet_bot', '_blank')" style="width: 100%;">
+                                ${t('openBot')}
+                            </button>
+                        </div>
+                    </div>
+                `;
             }
         }
 
@@ -1819,6 +2022,62 @@
                 userEmailEl.textContent = userData.email || '-';
             }
             if (userPasswordEl) {
+                userPasswordEl.textContent = userData.password || '-';
+            }
+            
+            // Обновляем баланс с конвертацией валюты
+            const userBalanceEl = document.getElementById('userBalance');
+            const balanceDisplayEl = document.getElementById('balanceDisplay');
+            
+            // Используем currentCurrency для отображения (может отличаться от preferred_currency)
+            const displayCurrency = currentCurrency || userData.preferred_currency || 'uah';
+            const currencySymbol = displayCurrency === 'uah' ? '₴' : displayCurrency === 'rub' ? '₽' : '$';
+            
+            // Получаем баланс в USD из userData
+            const balanceUsd = userData.balance_usd || (userData.balance && displayCurrency === 'usd' ? userData.balance : 0) || 0;
+            
+            // Конвертируем баланс в выбранную валюту
+            let balance = balanceUsd;
+            if (displayCurrency !== 'usd' && balanceUsd > 0) {
+                // Получаем курсы валют из localStorage или используем дефолтные
+                try {
+                    const currencyRatesStr = localStorage.getItem('currencyRates');
+                    if (currencyRatesStr) {
+                        const currencyRatesData = JSON.parse(currencyRatesStr);
+                        // API возвращает {rates: {UAH: 40.0, RUB: 100.0, USD: 1.0}} или просто объект
+                        const currencyRates = currencyRatesData.rates || currencyRatesData;
+                        const currencyKey = displayCurrency.toUpperCase();
+                        const rate = currencyRates[currencyKey];
+                        
+                        if (rate && typeof rate === 'number') {
+                            balance = balanceUsd * rate;
+                        } else {
+                            // Fallback на дефолтные курсы
+                            const defaultRate = displayCurrency === 'uah' ? 40 : displayCurrency === 'rub' ? 100 : 1;
+                            balance = balanceUsd * defaultRate;
+                        }
+                    } else {
+                        // Fallback на дефолтные курсы
+                        const defaultRate = displayCurrency === 'uah' ? 40 : displayCurrency === 'rub' ? 100 : 1;
+                        balance = balanceUsd * defaultRate;
+                    }
+                } catch (error) {
+                    console.error('Ошибка конвертации баланса:', error);
+                    // Fallback на дефолтные курсы
+                    const defaultRate = displayCurrency === 'uah' ? 40 : displayCurrency === 'rub' ? 100 : 1;
+                    balance = balanceUsd * defaultRate;
+                }
+            }
+            
+            if (userBalanceEl) {
+                userBalanceEl.textContent = `${balance.toFixed(2)} ${currencySymbol}`;
+            }
+            if (balanceDisplayEl) {
+                balanceDisplayEl.textContent = `${balance.toFixed(2)} ${currencySymbol}`;
+            }
+            
+            // Обновляем кнопку подключения
+            updateFloatingButton();
                 // Если пароль не найден в userData, загружаем его через API
                 if (!userData.password) {
                     loadUserPassword();
@@ -1839,22 +2098,31 @@
                 document.documentElement.lang = currentLanguage;
                 updateLanguageUI();
             }
-        }
+        
 
         function updateSettingsUI() {
-            // Устанавливаем текущую валюту
+            // Устанавливаем текущую валюту (приоритет: данные пользователя > localStorage > дефолт)
             if (userData?.preferred_currency) {
                 currentCurrency = userData.preferred_currency;
+                localStorage.setItem('preferredCurrency', currentCurrency);
+            } else if (localStorage.getItem('preferredCurrency')) {
+                currentCurrency = localStorage.getItem('preferredCurrency');
             }
+            
             const currencySelect = document.getElementById('currencySelect');
             if (currencySelect) {
                 currencySelect.value = currentCurrency;
+                console.log('Updated currency select to:', currentCurrency);
             }
 
-            // Устанавливаем текущий язык
+            // Устанавливаем текущий язык (приоритет: данные пользователя > localStorage > дефолт)
             if (userData?.preferred_lang) {
                 currentLanguage = userData.preferred_lang;
+                localStorage.setItem('preferredLanguage', currentLanguage);
+            } else if (localStorage.getItem('preferredLanguage')) {
+                currentLanguage = localStorage.getItem('preferredLanguage');
             }
+            
             const languageSelect = document.getElementById('languageSelect');
             if (languageSelect) {
                 languageSelect.value = currentLanguage;
@@ -2166,10 +2434,42 @@
                 'urlpay': '💳 UrlPay',
                 'telegram_stars': '⭐ Telegram Stars',
                 'monobank': '💳 Monobank',
-                'btcpayserver': '₿ BTCPayServer (Bitcoin)'
+                'btcpayserver': '₿ BTCPayServer (Bitcoin)',
+                'tribute': '💳 Tribute',
+                'robokassa': '💳 Robokassa',
+                'freekassa': '💳 Freekassa'
             };
 
-            paymentMethodsList.innerHTML = paymentMethods.map(method => {
+            let html = '';
+            
+            // Добавляем кнопку оплаты с баланса, если баланс достаточен
+            if (userData && userData.balance > 0 && selectedTariffId) {
+                const selectedTariff = tariffs.find(t => (t.id || t.tariff_id) === selectedTariffId);
+                if (selectedTariff) {
+                    const currency = userData.preferred_currency || 'uah';
+                    const priceMap = {
+                        uah: selectedTariff.price_uah,
+                        rub: selectedTariff.price_rub,
+                        usd: selectedTariff.price_usd
+                    };
+                    const tariffPrice = priceMap[currency] || priceMap.uah;
+                    const finalPrice = appliedPromo && appliedPromo.type === 'PERCENT' 
+                        ? tariffPrice * (1 - appliedPromo.value / 100) 
+                        : tariffPrice;
+                    const canAfford = userData.balance >= finalPrice;
+                    const currencySymbol = currency === 'uah' ? '₴' : currency === 'rub' ? '₽' : '$';
+                    
+                    html += `
+                        <div class="payment-method" onclick="createPayment('balance')" style="background: ${canAfford ? 'var(--accent-green)' : 'var(--accent-red)'}; opacity: ${canAfford ? 1 : 0.6};">
+                            💳 Оплатить с баланса (${finalPrice.toFixed(2)} ${currencySymbol})
+                            ${!canAfford ? '<br><small>Недостаточно средств</small>' : ''}
+                        </div>
+                    `;
+                }
+            }
+            
+            // Добавляем остальные способы оплаты
+            html += paymentMethods.map(method => {
                 const methodName = paymentNames[method.id] || method.name || method.id;
                 return `
                     <div class="payment-method" onclick="createPayment('${method.id}')">
@@ -2178,6 +2478,8 @@
                 `;
             }).join('');
 
+            paymentMethodsList.innerHTML = html || '<div style="padding: 20px; text-align: center; color: var(--text-secondary);">Нет доступных способов оплаты</div>';
+
             modal.classList.add('active');
         }
 
@@ -2185,8 +2487,143 @@
             document.getElementById('paymentModal').classList.remove('active');
         }
 
+        async function handleBalanceTopup(event) {
+            event.preventDefault();
+            const amountInput = document.getElementById('balanceAmount');
+            const statusDiv = document.getElementById('balanceTopupStatus');
+            const btn = document.getElementById('balanceTopupBtn');
+            
+            const amount = parseFloat(amountInput.value);
+            if (!amount || amount <= 0) {
+                statusDiv.textContent = 'Введите корректную сумму';
+                statusDiv.style.color = 'var(--accent-red)';
+                return;
+            }
+            
+            btn.disabled = true;
+            btn.textContent = 'Создание платежа...';
+            statusDiv.textContent = '';
+            
+            try {
+                const initData = tg.initData || '';
+                const telegramId = getUserFromInitData(initData);
+                
+                if (!telegramId) {
+                    throw new Error('Ошибка авторизации');
+                }
+                
+                // Получаем токен
+                const tokenResponse = await fetch('/api/bot/get-token', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ telegram_id: telegramId })
+                });
+                
+                if (!tokenResponse.ok) {
+                    throw new Error('Ошибка получения токена');
+                }
+                
+                const tokenData = await tokenResponse.json();
+                const token = tokenData.token;
+                
+                // Создаем платеж для пополнения баланса
+                const response = await fetch('/api/client/create-payment', {
+                    method: 'POST',
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        tariff_id: null,
+                        amount: amount,
+                        currency: userData?.preferred_currency || 'uah',
+                        payment_provider: 'crystalpay' // Можно выбрать другой
+                    })
+                });
+                
+                const data = await response.json();
+                
+                if (!response.ok) {
+                    throw new Error(data.message || 'Ошибка создания платежа');
+                }
+                
+                if (data.payment_url) {
+                    tg.openLink(data.payment_url);
+                } else {
+                    throw new Error('Не получена ссылка на оплату');
+                }
+            } catch (error) {
+                statusDiv.textContent = error.message || 'Ошибка пополнения баланса';
+                statusDiv.style.color = 'var(--accent-red)';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '💳 Пополнить баланс';
+            }
+        }
+
         async function createPayment(paymentMethod) {
             if (!selectedTariffId) return;
+
+            // Если оплата с баланса, используем специальный endpoint
+            if (paymentMethod === 'balance') {
+                try {
+                    const initData = tg.initData || '';
+                    const telegramId = getUserFromInitData(initData);
+                    
+                    if (!telegramId) {
+                        throw new Error('Ошибка авторизации');
+                    }
+                    
+                    // Получаем токен
+                    const tokenResponse = await fetch('/api/bot/get-token', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ telegram_id: telegramId })
+                    });
+                    
+                    if (!tokenResponse.ok) {
+                        throw new Error('Ошибка получения токена');
+                    }
+                    
+                    const tokenData = await tokenResponse.json();
+                    const token = tokenData.token;
+                    
+                    const payload = {
+                        tariff_id: selectedTariffId
+                    };
+                    
+                    // Добавляем промокод, если он применен
+                    if (appliedPromo && appliedPromo.type === 'PERCENT') {
+                        payload.promo_code = appliedPromo.code;
+                    }
+                    
+                    const response = await fetch('/api/client/purchase-with-balance', {
+                        method: 'POST',
+                        headers: {
+                            'Authorization': `Bearer ${token}`,
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify(payload)
+                    });
+
+                    const data = await response.json();
+                    
+                    if (response.ok) {
+                        tg.showAlert('Тариф успешно активирован!');
+                        closePaymentModal();
+                        // Перезагружаем данные
+                        setTimeout(() => {
+                            loadData();
+                        }, 1000);
+                    } else {
+                        tg.showAlert(data.message || 'Ошибка покупки тарифа');
+                    }
+                } catch (error) {
+                    console.error('Ошибка покупки с баланса:', error);
+                    tg.showAlert('Ошибка покупки тарифа');
+                }
+                return;
+            }
 
             try {
                 const initData = tg.initData || '';
@@ -2703,18 +3140,24 @@
             
             currentCurrency = newCurrency;
             
-            // Сохраняем настройки
+            // Сохраняем в localStorage для следующего открытия
+            localStorage.setItem('preferredCurrency', newCurrency);
+            
+            // Сохраняем настройки на сервере
             await saveSettings({ currency: newCurrency });
+            
+            // Обновляем userData
+            if (userData) {
+                userData.preferred_currency = newCurrency;
+            }
             
             // Обновляем отображение тарифов
             if (tariffs.length > 0) {
                 renderTariffs();
             }
             
-            // Обновляем userData
-            if (userData) {
-                userData.preferred_currency = newCurrency;
-            }
+            // Обновляем баланс с новой валютой
+            updateSubscriptionInfo();
             
             tg.showAlert(t('currencyChanged'));
         }
@@ -2795,10 +3238,18 @@
         // Загрузка данных при инициализации
         loadServerDomain();
         loadData();
+        
+        // Обновляем переключатель темы после загрузки DOM
+        setTimeout(() => {
+            updateThemeToggle();
+        }, 100);
+        
+        // Делаем функции доступными глобально для onclick
+        window.toggleTheme = toggleTheme;
     </script>
 
-    <!-- Плавающая кнопка подключения -->
-    <button id="floatingConnectBtn" class="btn floating-button hidden" onclick="handleConnectClick(event)">
+    <!-- Плавающая кнопка подключения (скрыта, используется кнопка в блоке статуса) -->
+    <button id="floatingConnectBtn" class="btn floating-button hidden" onclick="handleConnectClick(event)" style="display: none;">
         🚀 Подключиться
     </button>
 </body>

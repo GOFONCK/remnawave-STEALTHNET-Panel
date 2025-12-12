@@ -13,14 +13,17 @@ from typing import Optional
 from dotenv import load_dotenv
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo, KeyboardButton, ReplyKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
+    PreCheckoutQueryHandler,
     ContextTypes,
     filters
 )
+from telegram.error import Conflict
 
 # Загрузка переменных окружения
 load_dotenv()
@@ -35,7 +38,12 @@ logger = logging.getLogger(__name__)
 # Конфигурация
 CLIENT_BOT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")  # Токен бота для клиентов
 FLASK_API_URL = os.getenv("FLASK_API_URL", "http://localhost:5000")  # URL Flask API
-MINIAPP_URL = os.getenv("MINIAPP_URL", "https://panel.stealthnet.app")  # URL для miniapp
+YOUR_SERVER_IP = os.getenv("YOUR_SERVER_IP", "https://panel.stealthnet.app")  # URL сервера (панель)
+MINIAPP_URL = os.getenv("MINIAPP_URL", YOUR_SERVER_IP)  # URL для miniapp
+SERVICE_NAME = os.getenv("SERVICE_NAME", "StealthNET")  # Название сервиса (можно менять через env)
+
+# Путь к логотипу
+LOGO_PATH = os.path.join(os.path.dirname(__file__), "logo.png")
 
 
 def escape_markdown_v2(text: str) -> str:
@@ -70,6 +78,170 @@ def format_info_line(label: str, value: str, icon: str = "") -> str:
     if icon:
         return f"{icon} {label}: {value}\n"
     return f"{label}: {value}\n"
+
+
+async def reply_with_logo(update: Update, text: str, reply_markup=None, parse_mode=None):
+    """
+    Отправляет сообщение с логотипом сверху.
+    Всегда отправляет логотип с текстом в одном сообщении (фото с caption).
+    Если текст длиннее 1024 символов, обрезает его.
+    """
+    try:
+        # Обрезаем текст до 1024 символов, чтобы всегда помещался в caption
+        if len(text) > 1024:
+            text = text[:1021] + "..."
+        
+        # Проверяем существование файла логотипа
+        if not os.path.exists(LOGO_PATH):
+            logger.warning(f"Логотип не найден: {LOGO_PATH}, отправляем без логотипа")
+            if update.message:
+                await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            elif update.callback_query and update.callback_query.message:
+                await update.callback_query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            return
+        
+        # Определяем сообщение для ответа
+        message = update.message if update.message else (update.callback_query.message if update.callback_query else None)
+        if not message:
+            logger.error("Не удалось определить сообщение для ответа")
+            return
+        
+        # Всегда отправляем фото с caption в одном сообщении
+        with open(LOGO_PATH, 'rb') as logo_file:
+            await message.reply_photo(
+                photo=logo_file,
+                caption=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+    except Exception as e:
+        logger.error(f"Ошибка при отправке сообщения с логотипом: {e}")
+        # В случае ошибки отправляем обычное сообщение
+        try:
+            if update.message:
+                await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            elif update.callback_query and update.callback_query.message:
+                await update.callback_query.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception as e2:
+            logger.error(f"Ошибка при отправке обычного сообщения: {e2}")
+
+def get_days_text(days: int, lang: str) -> str:
+    """Получить правильное склонение для дней на указанном языке"""
+    if lang == 'ru':
+        if days == 1:
+            return f"{days} день"
+        elif 2 <= days <= 4:
+            return f"{days} дня"
+        else:
+            return f"{days} дней"
+    elif lang == 'ua':
+        if days == 1:
+            return f"{days} день"
+        elif 2 <= days <= 4:
+            return f"{days} дні"
+        else:
+            return f"{days} днів"
+    elif lang == 'en':
+        return f"{days} day{'s' if days != 1 else ''}"
+    elif lang == 'cn':
+        return f"{days} 天"
+    else:
+        return f"{days} {get_text('days', lang)}"
+
+
+async def safe_edit_or_send_with_logo(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str, reply_markup=None, parse_mode=None):
+    """
+    Безопасно редактирует сообщение или отправляет новое с логотипом.
+    Если сообщение содержит фото (логотип), удаляет его и отправляет новое.
+    """
+    query = update.callback_query
+    if not query:
+        # Если нет callback_query, просто отправляем новое сообщение
+        await reply_with_logo(update, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+    
+    message = query.message
+    if not message:
+        await reply_with_logo(update, text, reply_markup=reply_markup, parse_mode=parse_mode)
+        return
+    
+    # Проверяем, можно ли отредактировать сообщение (есть ли текст)
+    can_edit = message.text is not None
+    
+    if can_edit:
+        # Пытаемся отредактировать текстовое сообщение
+        try:
+            await query.edit_message_text(
+                text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode
+            )
+            return
+        except Exception as e:
+            error_str = str(e).lower()
+            # Если ошибка парсинга Markdown, пробуем без форматирования
+            if "markdown" in error_str or "parse" in error_str:
+                try:
+                    await query.edit_message_text(
+                        clean_markdown_for_cards(text),
+                        reply_markup=reply_markup
+                    )
+                    return
+                except:
+                    can_edit = False
+            # Если ошибка "no text in the message" или "message can't be edited", отправляем новое
+            elif "no text" in error_str or "can't be edited" in error_str or "message to edit" in error_str:
+                can_edit = False
+            else:
+                # Другая ошибка, отправляем новое
+                can_edit = False
+    
+    # Не можем отредактировать, удаляем старое и отправляем новое с логотипом
+    if not can_edit:
+        try:
+            await message.delete()
+        except:
+            pass  # Игнорируем ошибки удаления
+        
+        # Отправляем новое сообщение с логотипом
+        # Обрезаем текст до 1024 символов
+        display_text = text[:1021] + "..." if len(text) > 1024 else text
+        
+        try:
+            if os.path.exists(LOGO_PATH):
+                with open(LOGO_PATH, 'rb') as logo_file:
+                    await context.bot.send_photo(
+                        chat_id=message.chat.id,
+                        photo=logo_file,
+                        caption=display_text,
+                        reply_markup=reply_markup,
+                        parse_mode=parse_mode
+                    )
+            else:
+                await context.bot.send_message(
+                    chat_id=message.chat.id,
+                    text=display_text,
+                    reply_markup=reply_markup,
+                    parse_mode=parse_mode
+                )
+        except Exception as e2:
+            # Если ошибка с Markdown, отправляем без форматирования
+            logger.warning(f"Error sending message with logo: {e2}")
+            if os.path.exists(LOGO_PATH):
+                with open(LOGO_PATH, 'rb') as logo_file:
+                    await context.bot.send_photo(
+                        chat_id=message.chat.id,
+                        photo=logo_file,
+                        caption=clean_markdown_for_cards(display_text),
+                        reply_markup=reply_markup
+                    )
+            else:
+                await context.bot.send_message(
+                    chat_id=message.chat.id,
+                    text=clean_markdown_for_cards(display_text),
+                    reply_markup=reply_markup
+                )
+
 
 if not CLIENT_BOT_TOKEN:
     raise ValueError("CLIENT_BOT_TOKEN не установлен в переменных окружения!")
@@ -385,6 +557,26 @@ TRANSLATIONS = {
         'select_payment': 'Выберите способ оплаты',
         'payment_created': 'Платеж создан',
         'go_to_payment': 'Перейти к оплате',
+        'pay_with_balance': 'Оплатить с баланса',
+        'insufficient_balance': 'Недостаточно средств',
+        'top_up_balance': 'Пополнить баланс',
+        'enter_amount': 'Введите сумму пополнения',
+        'invalid_amount': 'Неверная сумма',
+        'select_topup_method': 'Выберите способ пополнения',
+        'balance_topup_created': 'Создан платеж на пополнение баланса',
+        'balance': 'Баланс',
+        'amount': 'Сумма',
+        'select_amount_hint': 'Выберите сумму или введите свою',
+        'enter_custom_amount': 'Ввести свою сумму',
+        'send_amount': 'Отправьте сумму пополнения числом',
+        'invalid_amount_format': 'Неверный формат суммы. Введите число (например: 1500)',
+        'amount_too_small': 'Минимальная сумма пополнения: 1',
+        'go_to_payment_button': 'Перейти к оплате',
+        'go_to_payment_text': 'Перейдите по ссылке для оплаты',
+        'after_payment': 'После оплаты баланс будет автоматически пополнен',
+        'payment_successful': 'Платеж успешно обработан',
+        'payment_processed': 'Ваш платеж обрабатывается',
+        'subscription_updating': 'Подписка обновляется...',
         'referral_program': 'Реферальная программа',
         'your_referral_link': 'Ваша реферальная ссылка',
         'your_code': 'Ваш код',
@@ -409,12 +601,12 @@ TRANSLATIONS = {
         'auth_error': 'Ошибка авторизации',
         'not_found': 'Не найдено',
         'loading': 'Загрузка...',
-        'welcome_bot': 'Добро пожаловать в StealthNET VPN Bot!',
+        'welcome_bot': f'Добро пожаловать в {SERVICE_NAME} VPN Bot!',
         'not_registered_text': 'Вы еще не зарегистрированы в системе.',
         'register_here': 'Вы можете зарегистрироваться прямо здесь в боте или на сайте.',
         'after_register': 'После регистрации вы получите логин и пароль для входа на сайте.',
         'welcome_user': 'Добро пожаловать',
-        'stealthnet_bot': 'StealthNET VPN Bot',
+        'stealthnet_bot': f'{SERVICE_NAME} VPN Bot',
         'subscription_status_title': 'Статус подписки',
         'active': 'Активна',
         'inactive': 'Не активна',
@@ -440,6 +632,10 @@ TRANSLATIONS = {
         'support_button': 'Поддержка',
         'settings_button': 'Настройки',
         'cabinet_button': 'Кабинет',
+        'user_agreement_button': 'Соглашение',
+        'offer_button': 'Оферта',
+        'user_agreement_title': '📄 Пользовательское соглашение',
+        'offer_title': '📋 Публичная оферта',
         'subscription_link': 'Ссылка подключения',
         'traffic_usage': 'Использование трафика',
         'unlimited_traffic_full': 'Безлимитный трафик',
@@ -574,6 +770,26 @@ TRANSLATIONS = {
         'select_payment': 'Виберіть спосіб оплати',
         'payment_created': 'Платіж створено',
         'go_to_payment': 'Перейти до оплати',
+        'pay_with_balance': 'Оплатити з балансу',
+        'insufficient_balance': 'Недостатньо коштів',
+        'top_up_balance': 'Поповнити баланс',
+        'enter_amount': 'Введіть суму поповнення',
+        'invalid_amount': 'Невірна сума',
+        'select_topup_method': 'Виберіть спосіб поповнення',
+        'balance_topup_created': 'Створено платіж на поповнення балансу',
+        'balance': 'Баланс',
+        'amount': 'Сума',
+        'select_amount_hint': 'Виберіть суму або введіть свою',
+        'enter_custom_amount': 'Ввести свою суму',
+        'send_amount': 'Відправте суму поповнення числом',
+        'invalid_amount_format': 'Невірний формат суми. Введіть число (наприклад: 1500)',
+        'amount_too_small': 'Мінімальна сума поповнення: 1',
+        'go_to_payment_button': 'Перейти до оплати',
+        'go_to_payment_text': 'Перейдіть за посиланням для оплати',
+        'after_payment': 'Після оплати баланс буде автоматично поповнено',
+        'payment_successful': 'Платіж успішно оброблено',
+        'payment_processed': 'Ваш платіж обробляється',
+        'subscription_updating': 'Підписка оновлюється...',
         'referral_program': 'Реферальна програма',
         'your_referral_link': 'Ваша реферальна посилання',
         'your_code': 'Ваш код',
@@ -598,12 +814,12 @@ TRANSLATIONS = {
         'auth_error': 'Помилка авторизації',
         'not_found': 'Не знайдено',
         'loading': 'Завантаження...',
-        'welcome_bot': 'Ласкаво просимо в StealthNET VPN Bot!',
+        'welcome_bot': f'Ласкаво просимо в {SERVICE_NAME} VPN Bot!',
         'not_registered_text': 'Ви ще не зареєстровані в системі.',
         'register_here': 'Ви можете зареєструватися прямо тут в боті або на сайті.',
         'after_register': 'Після реєстрації ви отримаєте логін і пароль для входу на сайті.',
         'welcome_user': 'Ласкаво просимо',
-        'stealthnet_bot': 'StealthNET VPN Bot',
+        'stealthnet_bot': f'{SERVICE_NAME} VPN Bot',
         'subscription_status_title': 'Статус підписки',
         'active': 'Активна',
         'inactive': 'Не активна',
@@ -629,6 +845,10 @@ TRANSLATIONS = {
         'support_button': 'Підтримка',
         'settings_button': 'Налаштування',
         'cabinet_button': 'Кабінет',
+        'user_agreement_button': 'Угода',
+        'offer_button': 'Оферта',
+        'user_agreement_title': '📄 Користувацька угода',
+        'offer_title': '📋 Публічна оферта',
         'subscription_link': 'Посилання підключення',
         'traffic_usage': 'Використання трафіку',
         'unlimited_traffic_full': 'Безлімітний трафік',
@@ -763,6 +983,26 @@ TRANSLATIONS = {
         'select_payment': 'Select payment method',
         'payment_created': 'Payment created',
         'go_to_payment': 'Go to payment',
+        'pay_with_balance': 'Pay with balance',
+        'insufficient_balance': 'Insufficient funds',
+        'top_up_balance': 'Top up balance',
+        'enter_amount': 'Enter top-up amount',
+        'invalid_amount': 'Invalid amount',
+        'select_topup_method': 'Select top-up method',
+        'balance_topup_created': 'Balance top-up payment created',
+        'balance': 'Balance',
+        'amount': 'Amount',
+        'select_amount_hint': 'Select amount or enter your own',
+        'enter_custom_amount': 'Enter custom amount',
+        'send_amount': 'Send the top-up amount as a number',
+        'invalid_amount_format': 'Invalid amount format. Enter a number (e.g., 1500)',
+        'amount_too_small': 'Minimum top-up amount: 1',
+        'go_to_payment_button': 'Go to Payment',
+        'go_to_payment_text': 'Go to the link to pay',
+        'after_payment': 'After payment, the balance will be automatically topped up',
+        'payment_successful': 'Payment successfully processed',
+        'payment_processed': 'Your payment is being processed',
+        'subscription_updating': 'Subscription updating...',
         'referral_program': 'Referral Program',
         'your_referral_link': 'Your referral link',
         'your_code': 'Your code',
@@ -787,12 +1027,12 @@ TRANSLATIONS = {
         'auth_error': 'Authorization error',
         'not_found': 'Not found',
         'loading': 'Loading...',
-        'welcome_bot': 'Welcome to StealthNET VPN Bot!',
+        'welcome_bot': f'Welcome to {SERVICE_NAME} VPN Bot!',
         'not_registered_text': 'You are not registered in the system yet.',
         'register_here': 'You can register right here in the bot or on the website.',
         'after_register': 'After registration, you will receive login and password to access the website.',
         'welcome_user': 'Welcome',
-        'stealthnet_bot': 'StealthNET VPN Bot',
+        'stealthnet_bot': f'{SERVICE_NAME} VPN Bot',
         'subscription_status_title': 'Subscription Status',
         'active': 'Active',
         'inactive': 'Inactive',
@@ -818,6 +1058,10 @@ TRANSLATIONS = {
         'support_button': 'Support',
         'settings_button': 'Settings',
         'cabinet_button': 'Cabinet',
+        'user_agreement_button': 'Agreement',
+        'offer_button': 'Offer',
+        'user_agreement_title': '📄 User Agreement',
+        'offer_title': '📋 Public Offer',
         'subscription_link': 'Connection Link',
         'traffic_usage': 'Traffic Usage',
         'unlimited_traffic_full': 'Unlimited Traffic',
@@ -952,6 +1196,26 @@ TRANSLATIONS = {
         'select_payment': '选择支付方式',
         'payment_created': '支付已创建',
         'go_to_payment': '前往支付',
+        'pay_with_balance': '使用余额支付',
+        'insufficient_balance': '余额不足',
+        'top_up_balance': '充值余额',
+        'enter_amount': '输入充值金额',
+        'invalid_amount': '无效金额',
+        'select_topup_method': '选择充值方式',
+        'balance_topup_created': '已创建余额充值支付',
+        'balance': '余额',
+        'amount': '金额',
+        'select_amount_hint': '选择金额或输入自定义金额',
+        'enter_custom_amount': '输入自定义金额',
+        'send_amount': '发送充值金额（数字）',
+        'invalid_amount_format': '金额格式无效。请输入数字（例如：1500）',
+        'amount_too_small': '最低充值金额：1',
+        'go_to_payment_button': '前往支付',
+        'go_to_payment_text': '前往链接进行支付',
+        'after_payment': '支付后余额将自动充值',
+        'payment_successful': '支付成功处理',
+        'payment_processed': '您的支付正在处理中',
+        'subscription_updating': '订阅更新中...',
         'referral_program': '推荐计划',
         'your_referral_link': '您的推荐链接',
         'your_code': '您的代码',
@@ -976,12 +1240,12 @@ TRANSLATIONS = {
         'auth_error': '授权错误',
         'not_found': '未找到',
         'loading': '加载中...',
-        'welcome_bot': '欢迎使用 StealthNET VPN Bot！',
+        'welcome_bot': f'欢迎使用 {SERVICE_NAME} VPN Bot！',
         'not_registered_text': '您尚未在系统中注册。',
         'register_here': '您可以在此处或网站上注册。',
         'after_register': '注册后，您将收到登录名和密码以访问网站。',
         'welcome_user': '欢迎',
-        'stealthnet_bot': 'StealthNET VPN Bot',
+        'stealthnet_bot': f'{SERVICE_NAME} VPN Bot',
         'subscription_status_title': '订阅状态',
         'active': '活跃',
         'inactive': '未活跃',
@@ -1007,6 +1271,10 @@ TRANSLATIONS = {
         'support_button': '支持',
         'settings_button': '设置',
         'cabinet_button': '办公室',
+        'user_agreement_button': '协议',
+        'offer_button': '要约',
+        'user_agreement_title': '📄 用户协议',
+        'offer_title': '📋 公开要约',
         'subscription_link': '连接链接',
         'traffic_usage': '流量使用',
         'unlimited_traffic_full': '无限流量',
@@ -1176,7 +1444,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"✅ {get_text('register', lang)}", callback_data="register_user")
             ],
             [
-                InlineKeyboardButton(f"🌐 {get_text('register', lang)} {get_text('on_site', lang)}", url="https://panel.stealthnet.app/register")
+                InlineKeyboardButton(f"🌐 {get_text('register', lang)} {get_text('on_site', lang)}", url=f"{YOUR_SERVER_IP}/register")
             ]
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1186,7 +1454,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"📝 {get_text('register_here', lang)}\n\n"
         text += f"💡 {get_text('after_register', lang)}"
         
-        await update.message.reply_text(text, reply_markup=reply_markup)
+        await reply_with_logo(update, text, reply_markup=reply_markup)
         return
     
     # Получаем данные пользователя
@@ -1194,19 +1462,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if not user_data:
         lang = get_user_lang(None, context, token)
-        await update.message.reply_text(f"❌ {get_text('failed_to_load_user', lang)}")
+        await reply_with_logo(update, f"❌ {get_text('failed_to_load_user', lang)}")
         return
     
     # Получаем язык пользователя
     user_lang = get_user_lang(user_data, context, token)
     
-    # Получаем данные для входа
-    credentials = api.get_credentials(telegram_id)
-    
     # Формируем приветственное сообщение с подробной информацией
-    welcome_text = f"🛡️ **{get_text('stealthnet_bot', user_lang)}**\n"
-    welcome_text += f"👋 {get_text('welcome_user', user_lang)}, {user.first_name}!\n\n"
-    welcome_text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    welcome_text = f"🛡 **{get_text('stealthnet_bot', user_lang)}**\n"
+    welcome_text += f"👋 {get_text('welcome_user', user_lang)}, {user.first_name}!\n"
+    welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
+    
+    # Баланс
+    balance = user_data.get("balance", 0)
+    preferred_currency = user_data.get("preferred_currency", "uah")
+    currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
+    welcome_text += f"💰 **{get_text('balance', user_lang)}:** {balance:.2f} {currency_symbol}\n"
     
     # Статус подписки
     is_active = user_data.get("activeInternalSquads", [])
@@ -1219,47 +1490,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         expire_date = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
         days_left = (expire_date - datetime.now(expire_date.tzinfo)).days
         
-        # Статус с индикатором - современный дизайн
+        # Статус с индикатором - в одну строку
         status_icon = "🟢" if days_left > 7 else "🟡" if days_left > 0 else "🔴"
-        welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}**\n"
-        welcome_text += f"{status_icon} {get_text('active', user_lang)}\n"
-        welcome_text += f"📅 {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
-        welcome_text += f"⏰ {days_left} {get_text('days', user_lang)}\n\n"
+        welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}** - {status_icon} {get_text('active', user_lang)}\n"
         
-        # Трафик с прогресс-баром - современный дизайн
-        welcome_text += f"📈 **{get_text('traffic_title', user_lang)}**\n"
+        # Дата с "до"
+        if user_lang == 'ru':
+            welcome_text += f"📅 до {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
+        elif user_lang == 'ua':
+            welcome_text += f"📅 до {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
+        elif user_lang == 'en':
+            welcome_text += f"📅 until {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
+        else:
+            welcome_text += f"📅 {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
+        
+        # Дни с правильным склонением
+        if user_lang == 'ru':
+            if days_left == 1:
+                days_text = f"{days_left} день"
+            elif 2 <= days_left <= 4:
+                days_text = f"{days_left} дня"
+            else:
+                days_text = f"{days_left} дней"
+            welcome_text += f"⏰ осталось {days_text}\n"
+        elif user_lang == 'ua':
+            if days_left == 1:
+                days_text = f"{days_left} день"
+            elif 2 <= days_left <= 4:
+                days_text = f"{days_left} дні"
+            else:
+                days_text = f"{days_left} днів"
+            welcome_text += f"⏰ залишилось {days_text}\n"
+        elif user_lang == 'en':
+            days_text = f"{days_left} day{'s' if days_left != 1 else ''}"
+            welcome_text += f"⏰ {days_text} left\n"
+        else:
+            days_text = get_days_text(days_left, user_lang)
+            welcome_text += f"⏰ {days_text}\n"
+        
+        # Трафик - в одну строку
         if traffic_limit == 0:
-            welcome_text += f"♾️ {get_text('unlimited_traffic', user_lang)}\n\n"
+            welcome_text += f"📈 **{get_text('traffic_title', user_lang)}**  - ♾️ {get_text('unlimited_traffic', user_lang)}\n"
         else:
             used_gb = used_traffic / (1024 ** 3)
             limit_gb = traffic_limit / (1024 ** 3)
             percentage = (used_traffic / traffic_limit * 100) if traffic_limit > 0 else 0
             
-            # Прогресс-бар (15 блоков)
             filled = int(percentage / (100 / 15))
             filled = min(filled, 15)
             progress_bar = "█" * filled + "░" * (15 - filled)
             progress_color = "🟢" if percentage < 70 else "🟡" if percentage < 90 else "🔴"
             
-            welcome_text += f"{progress_color} {progress_bar} {percentage:.0f}%\n"
-            welcome_text += f"📥 {used_gb:.2f} / {limit_gb:.2f} GB\n\n"
+            welcome_text += f"📈 **{get_text('traffic_title', user_lang)}**  - {progress_color} {progress_bar} {percentage:.0f}% ({used_gb:.2f} / {limit_gb:.2f} GB)\n"
+        
+        welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
     else:
         welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}**\n"
         welcome_text += f"🔴 {get_text('inactive', user_lang)}\n"
-        welcome_text += f"💡 {get_text('activate_trial_button', user_lang)}\n\n"
-    
-    # Данные для входа на сайте - современный дизайн
-    welcome_text += f"🔐 **{get_text('login_data_title', user_lang)}**\n"
-    if credentials and credentials.get("email"):
-        welcome_text += f"📧 `{credentials['email']}`\n"
-        if credentials.get("password"):
-            welcome_text += f"🔑 `{credentials['password']}`\n"
-        elif credentials.get("has_password"):
-            welcome_text += f"🔑 {get_text('password_set', user_lang)}\n"
-        else:
-            welcome_text += f"⚠️ {get_text('password_not_set', user_lang)}\n"
-    else:
-        welcome_text += f"❌ {get_text('data_not_found', user_lang)}\n"
+        welcome_text += f"💡 {get_text('activate_trial_button', user_lang)}\n"
+        welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
     
     # Кнопки главного меню
     keyboard = []
@@ -1282,12 +1571,19 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             InlineKeyboardButton(f"💎 {get_text('tariffs_button', user_lang)}", callback_data="tariffs")
         ],
         [
-            InlineKeyboardButton(f"🌐 {get_text('servers_button', user_lang)}", callback_data="servers"),
-            InlineKeyboardButton(f"🎁 {get_text('referrals_button', user_lang)}", callback_data="referrals")
+            InlineKeyboardButton(f"💰 {get_text('top_up_balance', user_lang)}", callback_data="topup_balance"),
+            InlineKeyboardButton(f"🌐 {get_text('servers_button', user_lang)}", callback_data="servers")
         ],
         [
-            InlineKeyboardButton(f"💬 {get_text('support_button', user_lang)}", callback_data="support"),
+            InlineKeyboardButton(f"🎁 {get_text('referrals_button', user_lang)}", callback_data="referrals"),
+            InlineKeyboardButton(f"💬 {get_text('support_button', user_lang)}", callback_data="support")
+        ],
+        [
             InlineKeyboardButton(f"⚙️ {get_text('settings_button', user_lang)}", callback_data="settings")
+        ],
+        [
+            InlineKeyboardButton(f"📄 {get_text('user_agreement_button', user_lang)}", callback_data="user_agreement"),
+            InlineKeyboardButton(f"📋 {get_text('offer_button', user_lang)}", callback_data="offer")
         ]
     ])
     
@@ -1304,21 +1600,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Если текст содержит карточки, убираем Markdown-форматирование
     if has_cards(welcome_text):
         welcome_text_clean = clean_markdown_for_cards(welcome_text)
-        await update.message.reply_text(
+        await reply_with_logo(
+            update,
             welcome_text_clean,
             reply_markup=reply_markup
         )
     else:
         # Для текста без карточек используем Markdown
         try:
-            await update.message.reply_text(
+            await reply_with_logo(
+                update,
                 welcome_text,
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
         except Exception as e:
             logger.warning(f"Markdown parsing error, sending without formatting: {e}")
-            await update.message.reply_text(
+            await reply_with_logo(
+                update,
                 clean_markdown_for_cards(welcome_text),
                 reply_markup=reply_markup
             )
@@ -1355,9 +1654,15 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     used_traffic = user_data.get("usedTrafficBytes", 0)
     traffic_limit = user_data.get("trafficLimitBytes", 0)
     subscription_url = user_data.get("subscriptionUrl", "")
+    balance = user_data.get("balance", 0)
+    preferred_currency = user_data.get("preferred_currency", "uah")
+    currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
     
     status_text = f"📊 **{get_text('subscription_status_title', user_lang)}**\n"
     status_text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    
+    # Баланс
+    status_text += f"💰 **Баланс:** {balance:.2f} {currency_symbol}\n\n"
     
     if is_active and expire_at:
         expire_date = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
@@ -1404,11 +1709,11 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if credentials.get("password"):
             status_text += f"🔑 `{credentials['password']}`\n\n"
             status_text += f"💡 {get_text('use_login_password', user_lang)}\n"
-            status_text += "🌐 https://panel.stealthnet.app\n"
+            status_text += f"🌐 {YOUR_SERVER_IP}\n"
         elif credentials.get("has_password"):
             status_text += f"🔑 {get_text('password_set', user_lang)}\n\n"
             status_text += f"💡 {get_text('use_login_password', user_lang)}\n"
-            status_text += "🌐 https://panel.stealthnet.app\n"
+            status_text += f"🌐 {YOUR_SERVER_IP}\n"
         else:
             status_text += f"⚠️ {get_text('password_not_set', user_lang)}\n"
     else:
@@ -1430,47 +1735,18 @@ async def show_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
     if has_cards(status_text):
         status_text_clean = clean_markdown_for_cards(status_text)
-        if update.callback_query:
-            await update.callback_query.edit_message_text(
-                status_text_clean,
-                reply_markup=reply_markup
-            )
-        else:
-            await update.message.reply_text(
-                status_text_clean,
-                reply_markup=reply_markup
-            )
+        await safe_edit_or_send_with_logo(update, context, status_text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            if update.callback_query:
-                await update.callback_query.edit_message_text(
-                    status_text,
-                    reply_markup=reply_markup,
-                    parse_mode="Markdown"
-                )
-            else:
-                await update.message.reply_text(
-                    status_text,
-                    reply_markup=reply_markup,
-                    parse_mode="Markdown"
-                )
+            await safe_edit_or_send_with_logo(update, context, status_text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error in show_status, sending without formatting: {e}")
+            logger.warning(f"Error in show_status, sending without formatting: {e}")
             status_text_clean = clean_markdown_for_cards(status_text)
-            if update.callback_query:
-                await update.callback_query.edit_message_text(
-                    status_text_clean,
-                    reply_markup=reply_markup
-                )
-            else:
-                await update.message.reply_text(
-                    status_text_clean,
-                    reply_markup=reply_markup
-                )
+            await safe_edit_or_send_with_logo(update, context, status_text_clean, reply_markup=reply_markup)
 
 
 async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1531,26 +1807,22 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Формируем сообщение с выбором типа тарифа
     text = "💎 **Тарифные планы**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
     
-    # Показываем краткую информацию о каждом типе в современном стиле
+    # Показываем краткую информацию о каждом типе в одну строку
     if basic_tariffs:
         min_price = min(t.get(currency_config["field"], 0) for t in basic_tariffs)
-        text += f"📦 **Базовый**\n"
-        text += f"💰 От {min_price:.0f} {symbol}\n"
-        text += f"📦 {len(basic_tariffs)} вариантов\n\n"
+        text += f"📦 Базовый |💰От {min_price:.0f} {symbol} |📦 {len(basic_tariffs)} вариантов\n"
     
     if pro_tariffs:
         min_price = min(t.get(currency_config["field"], 0) for t in pro_tariffs)
-        text += f"⭐ **Премиум**\n"
-        text += f"💰 От {min_price:.0f} {symbol}\n"
-        text += f"📦 {len(pro_tariffs)} вариантов\n\n"
+        text += f"⭐️ Премиум |💰От {min_price:.0f} {symbol} |📦 {len(pro_tariffs)} вариантов\n"
     
     if elite_tariffs:
         min_price = min(t.get(currency_config["field"], 0) for t in elite_tariffs)
-        text += f"👑 **Элитный**\n"
-        text += f"💰 От {min_price:.0f} {symbol}\n"
-        text += f"📦 {len(elite_tariffs)} вариантов\n\n"
+        text += f"👑 Элитный |💰От {min_price:.0f} {symbol} |📦 {len(elite_tariffs)} вариантов\n"
+    
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
     
     # Кнопки выбора типа тарифа
     keyboard = []
@@ -1567,27 +1839,18 @@ async def show_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await update.callback_query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error in show_tariffs, sending without formatting: {e}")
-            await update.callback_query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in show_tariffs, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
 
 
 async def show_tier_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE, tier: str):
@@ -1658,20 +1921,20 @@ async def show_tier_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     # Формируем сообщение
     tier_name = tier_names.get(tier, tier.capitalize())
     text = f"{tier_name} **тарифы**\n"
-    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
     text += "📅 Выберите длительность:\n\n"
     
-    # Показываем список тарифов в современном стиле
+    # Показываем список тарифов в одну строку
     for tariff in tier_tariffs:
         name = tariff.get("name", f"{tariff.get('duration_days', 0)} дней")
         price = tariff.get(price_field, 0)
         duration = tariff.get("duration_days", 0)
         per_day = price / duration if duration > 0 else price
         
-        text += f"📦 **{name}**\n"
-        text += f"💰 {price:.0f} {symbol}\n"
-        text += f"📊 {per_day:.2f} {symbol}/день\n"
+        text += f"📦 **{name}** | 💰 {price:.0f} {symbol}|📊 {per_day:.2f} {symbol}/день\n"
         text += f"⏱️ {duration} дней\n\n"
+    
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
     
     # Кнопки выбора длительности
     keyboard = []
@@ -1699,27 +1962,19 @@ async def show_tier_tariffs(update: Update, context: ContextTypes.DEFAULT_TYPE, 
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
+    temp_update = Update(update_id=0, callback_query=query)
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error, sending without formatting: {e}")
-            await query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in show_tier_tariffs, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
 
 
 async def show_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1751,16 +2006,17 @@ async def show_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = "🌐 **Серверы**\n\n❌ Серверы не найдены"
         keyboard = [[InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
-        # Если текст содержит карточки, убираем Markdown-форматирование
+        # Используем безопасную функцию для редактирования/отправки
         if has_cards(text):
             text_clean = clean_markdown_for_cards(text)
-            await update.callback_query.edit_message_text(text_clean, reply_markup=reply_markup)
+            await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
         else:
             try:
-                await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+                await safe_edit_or_send_with_logo(update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
             except Exception as e:
-                logger.warning(f"Markdown parsing error, sending without formatting: {e}")
-                await update.callback_query.edit_message_text(clean_markdown_for_cards(text), reply_markup=reply_markup)
+                logger.warning(f"Error in show_servers, sending without formatting: {e}")
+                text_clean = clean_markdown_for_cards(text)
+                await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
         return
     
     # Формируем сообщение
@@ -1788,27 +2044,18 @@ async def show_servers(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [[InlineKeyboardButton("🔙 Главное меню", callback_data="main_menu")]]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await update.callback_query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error in show_tariffs, sending without formatting: {e}")
-            await update.callback_query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in show_tariffs, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
 
 
 async def show_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1836,11 +2083,11 @@ async def show_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
         domain_resp = api.session.get(f"{FLASK_API_URL}/api/public/server-domain", timeout=5)
         if domain_resp.status_code == 200:
             domain_data = domain_resp.json()
-            server_domain = domain_data.get("full_url") or domain_data.get("domain") or "panel.stealthnet.app"
+            server_domain = domain_data.get("full_url") or domain_data.get("domain") or YOUR_SERVER_IP
         else:
-            server_domain = "panel.stealthnet.app"
+            server_domain = YOUR_SERVER_IP
     except:
-        server_domain = "panel.stealthnet.app"
+        server_domain = YOUR_SERVER_IP
     
     # Формируем ссылку
     if referral_code:
@@ -1852,7 +2099,7 @@ async def show_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     text = f"🎁 **{get_text('referral_program', user_lang)}**\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
-    text += f"💡 {get_text('invite_friends_bonus', user_lang)}\n\n"
+    text += f"💡 {get_text('invite_friends', user_lang)}\n\n"
     
     if referral_code:
         # Современный дизайн для реферальной ссылки
@@ -1871,27 +2118,18 @@ async def show_referrals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await update.callback_query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error in show_tariffs, sending without formatting: {e}")
-            await update.callback_query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in show_referrals, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
 
 
 async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1947,27 +2185,508 @@ async def show_support(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard.append([InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await update.callback_query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await update.callback_query.edit_message_text(
-                text,
+            await safe_edit_or_send_with_logo(update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Error in show_tariffs, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
+
+
+async def show_user_agreement(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать пользовательское соглашение"""
+    query = update.callback_query
+    telegram_id = update.effective_user.id
+    token = get_user_token(telegram_id)
+    user_lang = get_user_lang(None, context, token)
+    
+    # Текст пользовательского соглашения (можно вынести в отдельный файл или БД)
+    agreement_text = get_user_agreement_text(user_lang)
+    
+    # Обрезаем текст до 1024 символов, чтобы всегда помещался в caption
+    if len(agreement_text) > 1024:
+        agreement_text = agreement_text[:1021] + "..."
+    
+    keyboard = [
+        [InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = query.message
+    
+    # Всегда удаляем старое сообщение и отправляем новое с логотипом
+    try:
+        await message.delete()
+    except:
+        pass  # Игнорируем ошибки удаления
+    
+    # Отправляем новое сообщение с логотипом (всегда в одном сообщении)
+    try:
+        if os.path.exists(LOGO_PATH):
+            with open(LOGO_PATH, 'rb') as logo_file:
+                await context.bot.send_photo(
+                    chat_id=message.chat.id,
+                    photo=logo_file,
+                    caption=agreement_text,
+                    reply_markup=reply_markup,
+                    parse_mode="Markdown"
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=message.chat.id,
+                text=agreement_text,
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
             )
-        except Exception as e:
-            logger.warning(f"Markdown parsing error in show_tariffs, sending without formatting: {e}")
-            await update.callback_query.edit_message_text(
-                clean_markdown_for_cards(text),
+    except Exception as e:
+        # Если ошибка с Markdown, отправляем без форматирования
+        logger.warning(f"Error sending agreement with logo: {e}")
+        if os.path.exists(LOGO_PATH):
+            with open(LOGO_PATH, 'rb') as logo_file:
+                await context.bot.send_photo(
+                    chat_id=message.chat.id,
+                    photo=logo_file,
+                    caption=clean_markdown_for_cards(agreement_text),
+                    reply_markup=reply_markup
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=message.chat.id,
+                text=clean_markdown_for_cards(agreement_text),
                 reply_markup=reply_markup
             )
+
+
+async def show_offer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать публичную оферту"""
+    query = update.callback_query
+    telegram_id = update.effective_user.id
+    token = get_user_token(telegram_id)
+    user_lang = get_user_lang(None, context, token)
+    
+    # Текст публичной оферты (можно вынести в отдельный файл или БД)
+    offer_text = get_offer_text(user_lang)
+    
+    # Обрезаем текст до 1024 символов, чтобы всегда помещался в caption
+    if len(offer_text) > 1024:
+        offer_text = offer_text[:1021] + "..."
+    
+    keyboard = [
+        [InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    message = query.message
+    
+    # Всегда удаляем старое сообщение и отправляем новое с логотипом
+    try:
+        await message.delete()
+    except:
+        pass  # Игнорируем ошибки удаления
+    
+    # Отправляем новое сообщение с логотипом (всегда в одном сообщении)
+    try:
+        if os.path.exists(LOGO_PATH):
+            with open(LOGO_PATH, 'rb') as logo_file:
+                await context.bot.send_photo(
+                    chat_id=message.chat.id,
+                    photo=logo_file,
+                    caption=offer_text,
+                    reply_markup=reply_markup,
+                    parse_mode="Markdown"
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=message.chat.id,
+                text=offer_text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        # Если ошибка с Markdown, отправляем без форматирования
+        logger.warning(f"Error sending offer with logo: {e}")
+        if os.path.exists(LOGO_PATH):
+            with open(LOGO_PATH, 'rb') as logo_file:
+                await context.bot.send_photo(
+                    chat_id=message.chat.id,
+                    photo=logo_file,
+                    caption=clean_markdown_for_cards(offer_text),
+                    reply_markup=reply_markup
+                )
+        else:
+            await context.bot.send_message(
+                chat_id=message.chat.id,
+                text=clean_markdown_for_cards(offer_text),
+                reply_markup=reply_markup
+            )
+
+
+def get_user_agreement_text(lang: str = 'ru') -> str:
+    """Получить текст пользовательского соглашения на указанном языке"""
+    texts = {
+        'ru': """📄 **Пользовательское соглашение**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**1. Общие положения**
+
+1.1. Настоящее Пользовательское соглашение (далее — «Соглашение») определяет условия использования сервиса {SERVICE_NAME} VPN (далее — «Сервис»).
+
+1.2. Используя Сервис, Пользователь соглашается с условиями настоящего Соглашения.
+
+**2. Предмет соглашения**
+
+2.1. Сервис предоставляет услуги по обеспечению доступа к сети Интернет через VPN-соединение.
+
+2.2. Пользователь обязуется использовать Сервис в соответствии с законодательством и не нарушать права третьих лиц.
+
+**3. Права и обязанности**
+
+3.1. Пользователь имеет право использовать Сервис в соответствии с выбранным тарифным планом.
+
+3.2. Пользователь обязуется не использовать Сервис для противоправных действий.
+
+**4. Ответственность**
+
+4.1. Сервис не несет ответственности за действия Пользователя при использовании VPN-соединения.
+
+4.2. Пользователь несет полную ответственность за свои действия при использовании Сервиса.
+
+**5. Заключительные положения**
+
+5.1. Настоящее Соглашение вступает в силу с момента начала использования Сервиса.
+
+5.2. Администрация Сервиса оставляет за собой право изменять условия Соглашения.""",
+        'ua': """📄 **Користувацька угода**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**1. Загальні положення**
+
+1.1. Ця Користувацька угода (далі — «Угода») визначає умови використання сервісу {SERVICE_NAME} VPN (далі — «Сервіс»).
+
+1.2. Використовуючи Сервіс, Користувач погоджується з умовами цієї Угоди.
+
+**2. Предмет угоди**
+
+2.1. Сервіс надає послуги з забезпечення доступу до мережі Інтернет через VPN-з'єднання.
+
+2.2. Користувач зобов'язується використовувати Сервіс відповідно до законодавства та не порушувати права третіх осіб.
+
+**3. Права та обов'язки**
+
+3.1. Користувач має право використовувати Сервіс відповідно до обраного тарифного плану.
+
+3.2. Користувач зобов'язується не використовувати Сервіс для протиправних дій.
+
+**4. Відповідальність**
+
+4.1. Сервіс не несе відповідальності за дії Користувача при використанні VPN-з'єднання.
+
+4.2. Користувач несе повну відповідальність за свої дії при використанні Сервісу.
+
+**5. Заключні положення**
+
+5.1. Ця Угода набуває чинності з моменту початку використання Сервісу.
+
+5.2. Адміністрація Сервісу залишає за собою право змінювати умови Угоди.""",
+        'en': """📄 **User Agreement**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**1. General Provisions**
+
+1.1. This User Agreement (hereinafter — "Agreement") defines the terms of use of the {SERVICE_NAME} VPN service (hereinafter — "Service").
+
+1.2. By using the Service, the User agrees to the terms of this Agreement.
+
+**2. Subject of Agreement**
+
+2.1. The Service provides services for Internet access through VPN connection.
+
+2.2. The User undertakes to use the Service in accordance with the law and not to violate the rights of third parties.
+
+**3. Rights and Obligations**
+
+3.1. The User has the right to use the Service in accordance with the selected tariff plan.
+
+3.2. The User undertakes not to use the Service for illegal activities.
+
+**4. Liability**
+
+4.1. The Service is not responsible for the User's actions when using VPN connection.
+
+4.2. The User bears full responsibility for their actions when using the Service.
+
+**5. Final Provisions**
+
+5.1. This Agreement comes into force from the moment of starting to use the Service.
+
+5.2. The Service Administration reserves the right to change the terms of the Agreement.""",
+        'cn': """📄 **用户协议**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**1. 总则**
+
+1.1. 本用户协议（以下简称"协议"）定义了使用 {SERVICE_NAME} VPN 服务（以下简称"服务"）的条款。
+
+1.2. 使用服务即表示用户同意本协议的条款。
+
+**2. 协议主题**
+
+2.1. 服务提供通过 VPN 连接访问互联网的服务。
+
+2.2. 用户承诺按照法律使用服务，不侵犯第三方权利。
+
+**3. 权利和义务**
+
+3.1. 用户有权根据所选资费计划使用服务。
+
+3.2. 用户承诺不将服务用于非法活动。
+
+**4. 责任**
+
+4.1. 服务不对用户使用 VPN 连接时的行为负责。
+
+4.2. 用户对其使用服务时的行为承担全部责任。
+
+**5. 最终条款**
+
+5.1. 本协议自开始使用服务时生效。
+
+5.2. 服务管理方保留更改协议条款的权利。"""
+    }
+    text = texts.get(lang, texts['ru'])
+    # Форматируем текст, заменяя {SERVICE_NAME} на актуальное значение
+    return text.format(SERVICE_NAME=SERVICE_NAME)
+
+
+def get_offer_text(lang: str = 'ru') -> str:
+    """Получить текст публичной оферты на указанном языке"""
+    texts = {
+        'ru': """📋 **Публичная оферта**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**Оферта на оказание услуг VPN**
+
+Настоящий документ является публичной офертой (далее — «Оферта») в адрес физических и юридических лиц (далее — «Заказчик») о заключении договора на оказание услуг VPN (далее — «Договор»).
+
+**1. Термины и определения**
+
+1.1. **Исполнитель** — {SERVICE_NAME} VPN, предоставляющий услуги VPN.
+
+1.2. **Заказчик** — физическое или юридическое лицо, принявшее условия настоящей Оферты.
+
+1.3. **Услуги** — услуги по предоставлению доступа к сети Интернет через VPN-соединение.
+
+1.4. **Тарифный план** — выбранный Заказчиком пакет услуг с определенными характеристиками и стоимостью.
+
+**2. Предмет договора**
+
+2.1. Исполнитель обязуется предоставить Заказчику услуги VPN в соответствии с выбранным Тарифным планом.
+
+2.2. Заказчик обязуется оплатить услуги в размере и порядке, указанных в Тарифном плане.
+
+**3. Порядок оказания услуг**
+
+3.1. Услуги предоставляются после оплаты выбранного Тарифного плана.
+
+3.2. Доступ к услугам предоставляется в течение 24 часов с момента оплаты.
+
+**4. Стоимость услуг и порядок расчетов**
+
+4.1. Стоимость услуг определяется в соответствии с выбранным Тарифным планом.
+
+4.2. Оплата производится в порядке, указанном на сайте Сервиса.
+
+**5. Права и обязанности сторон**
+
+5.1. Исполнитель обязуется предоставить услуги в соответствии с условиями Договора.
+
+5.2. Заказчик обязуется использовать услуги в соответствии с законодательством.
+
+**6. Ответственность сторон**
+
+6.1. Исполнитель не несет ответственности за действия Заказчика при использовании услуг.
+
+6.2. Заказчик несет полную ответственность за свои действия.
+
+**7. Заключительные положения**
+
+7.1. Акцептом настоящей Оферты является оплата услуг Заказчиком.
+
+7.2. Настоящая Оферта вступает в силу с момента публикации на сайте.""",
+        'ua': """📋 **Публічна оферта**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**Оферта на надання послуг VPN**
+
+Цей документ є публічною офертою (далі — «Оферта») на адресу фізичних та юридичних осіб (далі — «Замовник») про укладення договору на надання послуг VPN (далі — «Договір»).
+
+**1. Терміни та визначення**
+
+1.1. **Виконавець** — {SERVICE_NAME} VPN, що надає послуги VPN.
+
+1.2. **Замовник** — фізична або юридична особа, яка прийняла умови цієї Оферти.
+
+1.3. **Послуги** — послуги з надання доступу до мережі Інтернет через VPN-з'єднання.
+
+1.4. **Тарифний план** — обраний Замовником пакет послуг з певними характеристиками та вартістю.
+
+**2. Предмет договору**
+
+2.1. Виконавець зобов'язується надати Замовнику послуги VPN відповідно до обраного Тарифного плану.
+
+2.2. Замовник зобов'язується оплатити послуги в розмірі та порядку, зазначених у Тарифному плані.
+
+**3. Порядок надання послуг**
+
+3.1. Послуги надаються після оплати обраного Тарифного плану.
+
+3.2. Доступ до послуг надається протягом 24 годин з моменту оплати.
+
+**4. Вартість послуг та порядок розрахунків**
+
+4.1. Вартість послуг визначається відповідно до обраного Тарифного плану.
+
+4.2. Оплата здійснюється в порядку, зазначеному на сайті Сервісу.
+
+**5. Права та обов'язки сторін**
+
+5.1. Виконавець зобов'язується надати послуги відповідно до умов Договору.
+
+5.2. Замовник зобов'язується використовувати послуги відповідно до законодавства.
+
+**6. Відповідальність сторін**
+
+6.1. Виконавець не несе відповідальності за дії Замовника при використанні послуг.
+
+6.2. Замовник несе повну відповідальність за свої дії.
+
+**7. Заключні положення**
+
+7.1. Акцептом цієї Оферти є оплата послуг Замовником.
+
+7.2. Ця Оферта набуває чинності з моменту публікації на сайті.""",
+        'en': """📋 **Public Offer**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**Offer for VPN Services**
+
+This document is a public offer (hereinafter — "Offer") addressed to individuals and legal entities (hereinafter — "Customer") for concluding a contract for VPN services (hereinafter — "Contract").
+
+**1. Terms and Definitions**
+
+1.1. **Contractor** — {SERVICE_NAME} VPN, providing VPN services.
+
+1.2. **Customer** — an individual or legal entity that has accepted the terms of this Offer.
+
+1.3. **Services** — services for providing Internet access through VPN connection.
+
+1.4. **Tariff Plan** — a package of services selected by the Customer with certain characteristics and cost.
+
+**2. Subject of Contract**
+
+2.1. The Contractor undertakes to provide the Customer with VPN services in accordance with the selected Tariff Plan.
+
+2.2. The Customer undertakes to pay for the services in the amount and manner specified in the Tariff Plan.
+
+**3. Procedure for Providing Services**
+
+3.1. Services are provided after payment of the selected Tariff Plan.
+
+3.2. Access to services is provided within 24 hours from the moment of payment.
+
+**4. Cost of Services and Payment Procedure**
+
+4.1. The cost of services is determined in accordance with the selected Tariff Plan.
+
+4.2. Payment is made in the manner specified on the Service website.
+
+**5. Rights and Obligations of the Parties**
+
+5.1. The Contractor undertakes to provide services in accordance with the terms of the Contract.
+
+5.2. The Customer undertakes to use the services in accordance with the law.
+
+**6. Liability of the Parties**
+
+6.1. The Contractor is not responsible for the Customer's actions when using the services.
+
+6.2. The Customer bears full responsibility for their actions.
+
+**7. Final Provisions**
+
+7.1. Acceptance of this Offer is the payment for services by the Customer.
+
+7.2. This Offer comes into force from the moment of publication on the website.""",
+        'cn': """📋 **公开要约**
+
+━━━━━━━━━━━━━━━━━━━━
+
+**VPN 服务要约**
+
+本文件是向个人和法律实体（以下简称"客户"）发出的关于签订 VPN 服务合同（以下简称"合同"）的公开要约（以下简称"要约"）。
+
+**1. 术语和定义**
+
+1.1. **承包商** — {SERVICE_NAME} VPN，提供 VPN 服务。
+
+1.2. **客户** — 接受本要约条款的个人或法律实体。
+
+1.3. **服务** — 通过 VPN 连接提供互联网访问的服务。
+
+1.4. **资费计划** — 客户选择的服务包，具有特定特征和成本。
+
+**2. 合同主题**
+
+2.1. 承包商承诺根据所选资费计划向客户提供 VPN 服务。
+
+2.2. 客户承诺按照资费计划中规定的金额和方式支付服务费用。
+
+**3. 服务提供程序**
+
+3.1. 服务在支付所选资费计划后提供。
+
+3.2. 服务访问在付款后 24 小时内提供。
+
+**4. 服务费用和付款程序**
+
+4.1. 服务费用根据所选资费计划确定。
+
+4.2. 付款按照服务网站上规定的方式进行。
+
+**5. 双方的权利和义务**
+
+5.1. 承包商承诺按照合同条款提供服务。
+
+5.2. 客户承诺按照法律使用服务。
+
+**6. 双方的责任**
+
+6.1. 承包商不对客户使用服务时的行为负责。
+
+6.2. 客户对其行为承担全部责任。
+
+**7. 最终条款**
+
+7.1. 接受本要约即客户支付服务费用。
+
+7.2. 本要约自网站发布之日起生效。"""
+    }
+    text = texts.get(lang, texts['ru'])
+    # Форматируем текст, заменяя {SERVICE_NAME} на актуальное значение
+    return text.format(SERVICE_NAME=SERVICE_NAME)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1991,6 +2710,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.warning(f"Error answering callback query: {e}")
         # Продолжаем выполнение даже если не удалось ответить
     
+    if data == "user_agreement":
+        await show_user_agreement(update, context)
+        return
+    
+    if data == "offer":
+        await show_offer(update, context)
+        return
+    
     if data == "main_menu":
         # Возвращаемся к главному меню с полной информацией
         user = update.effective_user
@@ -1999,15 +2726,20 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         token = get_user_token(telegram_id)
         if token:
             user_data = api.get_user_data(token)
-            credentials = api.get_credentials(telegram_id)
             
             if user_data:
                 # Получаем язык пользователя
                 user_lang = get_user_lang(user_data, context, token)
                 
-                welcome_text = f"🛡️ **{get_text('stealthnet_bot', user_lang)}**\n"
-                welcome_text += f"👋 {get_text('main_menu_button', user_lang)}\n\n"
-                welcome_text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+                welcome_text = f"🛡 **{get_text('stealthnet_bot', user_lang)}**\n"
+                welcome_text += f"👋 {get_text('main_menu_button', user_lang)}\n"
+                welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
+                
+                # Баланс
+                balance = user_data.get("balance", 0)
+                preferred_currency = user_data.get("preferred_currency", "uah")
+                currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
+                welcome_text += f"💰 **{get_text('balance', user_lang)}:** {balance:.2f} {currency_symbol}\n"
                 
                 # Статус подписки
                 is_active = user_data.get("activeInternalSquads", [])
@@ -2020,16 +2752,47 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     expire_date = datetime.fromisoformat(expire_at.replace('Z', '+00:00'))
                     days_left = (expire_date - datetime.now(expire_date.tzinfo)).days
                     
+                    # Статус с индикатором - в одну строку
                     status_icon = "🟢" if days_left > 7 else "🟡" if days_left > 0 else "🔴"
-                    welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}**\n"
-                    welcome_text += f"{status_icon} {get_text('active', user_lang)}\n"
-                    welcome_text += f"📅 {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
-                    welcome_text += f"⏰ {days_left} {get_text('days', user_lang)}\n\n"
+                    welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}** - {status_icon} {get_text('active', user_lang)}\n"
                     
-                    # Трафик
-                    welcome_text += f"📈 **{get_text('traffic_title', user_lang)}**\n"
+                    # Дата с "до"
+                    if user_lang == 'ru':
+                        welcome_text += f"📅 до {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
+                    elif user_lang == 'ua':
+                        welcome_text += f"📅 до {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
+                    elif user_lang == 'en':
+                        welcome_text += f"📅 until {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
+                    else:
+                        welcome_text += f"📅 {expire_date.strftime('%d.%m.%Y %H:%M')}\n"
+                    
+                    # Дни с правильным склонением
+                    if user_lang == 'ru':
+                        if days_left == 1:
+                            days_text = f"{days_left} день"
+                        elif 2 <= days_left <= 4:
+                            days_text = f"{days_left} дня"
+                        else:
+                            days_text = f"{days_left} дней"
+                        welcome_text += f"⏰ осталось {days_text}\n"
+                    elif user_lang == 'ua':
+                        if days_left == 1:
+                            days_text = f"{days_left} день"
+                        elif 2 <= days_left <= 4:
+                            days_text = f"{days_left} дні"
+                        else:
+                            days_text = f"{days_left} днів"
+                        welcome_text += f"⏰ залишилось {days_text}\n"
+                    elif user_lang == 'en':
+                        days_text = f"{days_left} day{'s' if days_left != 1 else ''}"
+                        welcome_text += f"⏰ {days_text} left\n"
+                    else:
+                        days_text = get_days_text(days_left, user_lang)
+                        welcome_text += f"⏰ {days_text}\n"
+                    
+                    # Трафик - в одну строку
                     if traffic_limit == 0:
-                        welcome_text += f"♾️ {get_text('unlimited_traffic', user_lang)}\n\n"
+                        welcome_text += f"📈 **{get_text('traffic_title', user_lang)}**  - ♾️ {get_text('unlimited_traffic', user_lang)}\n"
                     else:
                         used_gb = used_traffic / (1024 ** 3)
                         limit_gb = traffic_limit / (1024 ** 3)
@@ -2040,21 +2803,13 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         progress_bar = "█" * filled + "░" * (15 - filled)
                         progress_color = "🟢" if percentage < 70 else "🟡" if percentage < 90 else "🔴"
                         
-                        welcome_text += f"{progress_color} {progress_bar} {percentage:.0f}%\n"
-                        welcome_text += f"📥 {used_gb:.2f} / {limit_gb:.2f} GB\n\n"
+                        welcome_text += f"📈 **{get_text('traffic_title', user_lang)}**  - {progress_color} {progress_bar} {percentage:.0f}% ({used_gb:.2f} / {limit_gb:.2f} GB)\n"
+                    
+                    welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
                 else:
                     welcome_text += f"📊 **{get_text('subscription_status_title', user_lang)}**\n"
-                    welcome_text += f"🔴 {get_text('inactive', user_lang)}\n\n"
-                
-                # Данные для входа
-                welcome_text += f"🔐 **{get_text('login_data_title', user_lang)}**\n"
-                if credentials and credentials.get("email"):
-                    welcome_text += f"📧 `{credentials['email']}`\n"
-                    if credentials.get("password"):
-                        welcome_text += f"🔑 `{credentials['password']}`\n"
-                    elif credentials.get("has_password"):
-                        welcome_text += f"🔑 {get_text('password_set', user_lang)}\n"
-                welcome_text += "\n"
+                    welcome_text += f"🔴 {get_text('inactive', user_lang)}\n"
+                    welcome_text += "━━━━━━━━━━━━━━━━━━━━\n"
                 
                 keyboard = []
                 
@@ -2076,12 +2831,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         InlineKeyboardButton(f"💎 {get_text('tariffs_button', user_lang)}", callback_data="tariffs")
                     ],
                     [
-                        InlineKeyboardButton(f"🌐 {get_text('servers_button', user_lang)}", callback_data="servers"),
-                        InlineKeyboardButton(f"🎁 {get_text('referrals_button', user_lang)}", callback_data="referrals")
+                        InlineKeyboardButton(f"💰 {get_text('top_up_balance', user_lang)}", callback_data="topup_balance"),
+                        InlineKeyboardButton(f"🌐 {get_text('servers_button', user_lang)}", callback_data="servers")
                     ],
                     [
-                        InlineKeyboardButton(f"💬 {get_text('support_button', user_lang)}", callback_data="support"),
+                        InlineKeyboardButton(f"🎁 {get_text('referrals_button', user_lang)}", callback_data="referrals"),
+                        InlineKeyboardButton(f"💬 {get_text('support_button', user_lang)}", callback_data="support")
+                    ],
+                    [
                         InlineKeyboardButton(f"⚙️ {get_text('settings_button', user_lang)}", callback_data="settings")
+                    ],
+                    [
+                        InlineKeyboardButton(f"📄 {get_text('user_agreement_button', user_lang)}", callback_data="user_agreement"),
+                        InlineKeyboardButton(f"📋 {get_text('offer_button', user_lang)}", callback_data="offer")
                     ]
                 ])
                 
@@ -2093,19 +2855,18 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 
                 reply_markup = InlineKeyboardMarkup(keyboard)
                 
-                # Если текст содержит карточки, убираем Markdown-форматирование
+                # Используем безопасную функцию для редактирования/отправки
+                temp_update = Update(update_id=0, callback_query=query)
                 if has_cards(welcome_text):
                     welcome_text_clean = clean_markdown_for_cards(welcome_text)
-                    await query.edit_message_text(welcome_text_clean, reply_markup=reply_markup)
+                    await safe_edit_or_send_with_logo(temp_update, context, welcome_text_clean, reply_markup=reply_markup)
                 else:
                     try:
-                        await query.edit_message_text(welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
+                        await safe_edit_or_send_with_logo(temp_update, context, welcome_text, reply_markup=reply_markup, parse_mode="Markdown")
                     except Exception as e:
-                        logger.warning(f"Markdown parsing error in main_menu, sending without formatting: {e}")
-                        await query.edit_message_text(
-                            clean_markdown_for_cards(welcome_text),
-                            reply_markup=reply_markup
-                        )
+                        logger.warning(f"Error in main_menu, sending without formatting: {e}")
+                        welcome_text_clean = clean_markdown_for_cards(welcome_text)
+                        await safe_edit_or_send_with_logo(temp_update, context, welcome_text_clean, reply_markup=reply_markup)
                 return
         
         # Fallback если не удалось загрузить данные
@@ -2119,12 +2880,19 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"💎 {get_text('tariffs_button', lang)}", callback_data="tariffs")
             ],
             [
-                InlineKeyboardButton(f"🌐 {get_text('servers_button', lang)}", callback_data="servers"),
-                InlineKeyboardButton(f"🎁 {get_text('referrals_button', lang)}", callback_data="referrals")
+                InlineKeyboardButton(f"💰 {get_text('top_up_balance', lang)}", callback_data="topup_balance"),
+                InlineKeyboardButton(f"🌐 {get_text('servers_button', lang)}", callback_data="servers")
             ],
             [
-                InlineKeyboardButton(f"💬 {get_text('support_button', lang)}", callback_data="support"),
+                InlineKeyboardButton(f"🎁 {get_text('referrals_button', lang)}", callback_data="referrals"),
+                InlineKeyboardButton(f"💬 {get_text('support_button', lang)}", callback_data="support")
+            ],
+            [
                 InlineKeyboardButton(f"⚙️ {get_text('settings_button', lang)}", callback_data="settings")
+            ],
+            [
+                InlineKeyboardButton(f"📄 {get_text('user_agreement_button', lang)}", callback_data="user_agreement"),
+                InlineKeyboardButton(f"📋 {get_text('offer_button', lang)}", callback_data="offer")
             ]
         ]
         
@@ -2133,7 +2901,9 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 InlineKeyboardButton(f"📱 {get_text('cabinet_button', lang)}", web_app=WebAppInfo(url=MINIAPP_URL))
             ])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(welcome_text, reply_markup=reply_markup)
+        # Используем безопасную функцию для редактирования/отправки
+        temp_update = Update(update_id=0, callback_query=query)
+        await safe_edit_or_send_with_logo(temp_update, context, welcome_text, reply_markup=reply_markup)
     
     elif data == "status":
         await show_status(update, context)
@@ -2153,6 +2923,61 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     elif data == "support":
         await show_support(update, context)
+    
+    elif data == "topup_balance":
+        await show_topup_balance(update, context)
+    
+    elif data.startswith("topup_amount_"):
+        try:
+            amount = float(data.replace("topup_amount_", ""))
+            await select_topup_method(update, context, amount)
+        except (ValueError, IndexError):
+            await query.answer("❌ Ошибка: неверная сумма")
+    
+    elif data == "topup_custom_amount":
+        # Устанавливаем состояние ожидания ввода суммы
+        user = update.effective_user
+        telegram_id = user.id
+        
+        token = get_user_token(telegram_id)
+        if not token:
+            lang = get_user_lang(None, context, token)
+            await query.answer(f"❌ {get_text('auth_error', lang)}")
+            return
+        
+        user_data_api = api.get_user_data(token)
+        if not user_data_api:
+            lang = get_user_lang(None, context, token)
+            await query.answer(f"❌ {get_text('failed_to_load', lang)}")
+            return
+        
+        user_lang = get_user_lang(user_data_api, context, token)
+        preferred_currency = user_data_api.get("preferred_currency", "uah")
+        currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
+        
+        # Устанавливаем состояние в context.user_data
+        context.user_data["waiting_for_topup_amount"] = True
+        
+        text = f"💰 **{get_text('top_up_balance', user_lang)}**\n"
+        text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+        text += f"📝 {get_text('enter_amount', user_lang)}\n\n"
+        text += f"💡 Введите сумму в {currency_symbol} (например: 1500 или 1500.50)"
+        
+        keyboard = [
+            [InlineKeyboardButton(f"🔙 {get_text('back', user_lang)}", callback_data="topup_balance")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await safe_edit_or_send_with_logo(update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+    
+    elif data.startswith("topup_pay_"):
+        try:
+            parts = data.replace("topup_pay_", "").split("_")
+            amount = float(parts[0])
+            provider = "_".join(parts[1:])
+            await handle_topup_payment(update, context, amount, provider)
+        except (ValueError, IndexError):
+            await query.answer("❌ Ошибка: неверные данные")
     
     elif data == "activate_trial":
         await activate_trial(update, context)
@@ -2178,11 +3003,11 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             domain_resp = api.session.get(f"{FLASK_API_URL}/api/public/server-domain", timeout=5)
             if domain_resp.status_code == 200:
                 domain_data = domain_resp.json()
-                server_domain = domain_data.get("full_url") or domain_data.get("domain") or "panel.stealthnet.app"
+                server_domain = domain_data.get("full_url") or domain_data.get("domain") or YOUR_SERVER_IP
             else:
-                server_domain = "panel.stealthnet.app"
+                server_domain = YOUR_SERVER_IP
         except:
-            server_domain = "panel.stealthnet.app"
+            server_domain = YOUR_SERVER_IP
         
         # Формируем ссылку
         if not server_domain.startswith("http"):
@@ -2191,7 +3016,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Отправляем ссылку отдельным сообщением для удобного копирования
         await query.answer(f"✅ {get_text('link_sent_to_chat', user_lang)}", show_alert=False)
-        await query.message.reply_text(
+        # Создаем Update объект для reply_with_logo
+        temp_update = Update(update_id=0, message=query.message)
+        await reply_with_logo(
+            temp_update,
             f"🔗 **{get_text('your_referral_link', user_lang)}**\n\n"
             f"`{referral_link}`\n\n"
             f"{get_text('click_link_to_copy', user_lang)}.",
@@ -2205,7 +3033,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_data = api.get_user_data(token) if token else None
         user_lang = get_user_lang(user_data, context, token)
         
-        await query.edit_message_text(
+        temp_update = Update(update_id=0, callback_query=query)
+        await safe_edit_or_send_with_logo(
+            temp_update,
+            context,
             f"💬 **{get_text('creating_ticket', user_lang)}**\n\n"
             f"{get_text('send_ticket_subject', user_lang)}:",
             parse_mode="Markdown"
@@ -2228,7 +3059,10 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_data = api.get_user_data(token) if token else None
             user_lang = get_user_lang(user_data, context, token)
             
-            await query.edit_message_text(
+            temp_update = Update(update_id=0, callback_query=query)
+            await safe_edit_or_send_with_logo(
+                temp_update,
+                context,
                 f"💬 **{get_text('reply_to_ticket', user_lang)}**\n\n"
                 f"{get_text('ticket', user_lang)} #{ticket_id}\n\n"
                 f"{get_text('send_your_reply', user_lang)}:",
@@ -2330,47 +3164,18 @@ async def show_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
+    temp_update = Update(update_id=0, callback_query=query)
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        try:
-            await query.edit_message_text(
-                text_clean,
-                reply_markup=reply_markup
-            )
-        except Exception as e:
-            # Обрабатываем ошибку "Message is not modified"
-            if "not modified" in str(e).lower():
-                pass
-            else:
-                logger.error(f"Error editing message in show_settings: {e}")
-                try:
-                    await query.message.reply_text(
-                        text_clean,
-                        reply_markup=reply_markup
-                    )
-                except:
-                    pass
+        await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     else:
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            # Обрабатываем ошибку "Message is not modified"
-            if "not modified" in str(e).lower():
-                pass
-            else:
-                logger.error(f"Error editing message in show_settings: {e}")
-                try:
-                    await query.message.reply_text(
-                        clean_markdown_for_cards(text),
-                        reply_markup=reply_markup
-                    )
-                except:
-                    pass
+            logger.warning(f"Error in show_settings, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
 
 
 async def set_currency(update: Update, context: ContextTypes.DEFAULT_TYPE, currency: str):
@@ -2460,19 +3265,11 @@ async def set_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang:
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        temp_update = Update(update_id=0, callback_query=query)
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            # Обрабатываем ошибку "Message is not modified"
-            if "not modified" in str(e).lower():
-                # Игнорируем эту ошибку - сообщение уже правильное
-                pass
-            else:
-                logger.error(f"Error editing message in set_language: {e}")
+            logger.error(f"Error in set_language: {e}")
         return
     
     # Устанавливаем язык
@@ -2534,7 +3331,10 @@ async def view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket
     ticket_data = api.get_ticket_messages(token, ticket_id)
     
     if not ticket_data or not ticket_data.get("messages"):
-        await query.edit_message_text(
+        temp_update = Update(update_id=0, callback_query=query)
+        await safe_edit_or_send_with_logo(
+            temp_update,
+            context,
             f"❌ **{get_text('error_loading', user_lang)}**\n\n"
             f"{get_text('ticket_not_found', user_lang)} #{ticket_id}.\n"
             f"{get_text('ticket_not_exists', user_lang)}",
@@ -2588,27 +3388,19 @@ async def view_ticket(update: Update, context: ContextTypes.DEFAULT_TYPE, ticket
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
+    temp_update = Update(update_id=0, callback_query=query)
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error, sending without formatting: {e}")
-            await query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in view_ticket, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
 
 
 async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2632,7 +3424,7 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Используем русский по умолчанию для незарегистрированных
     lang = 'ru'
     
-    text = "🛡️ **StealthNET VPN**\n"
+    text = f"🛡️ **{SERVICE_NAME} VPN**\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     
     text += "👋 **Добро пожаловать!**\n\n"
@@ -2651,27 +3443,19 @@ async def register_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
+    temp_update = Update(update_id=0, callback_query=query)
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error, sending without formatting: {e}")
-            await query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in register_user, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
 
 
 async def register_select_language(update: Update, context: ContextTypes.DEFAULT_TYPE, lang: str):
@@ -2688,7 +3472,7 @@ async def register_select_language(update: Update, context: ContextTypes.DEFAULT
     
     await query.answer(f"✅ Язык: {lang_name}")
     
-    text = "🛡️ **StealthNET VPN**\n"
+    text = f"🛡️ **{SERVICE_NAME} VPN**\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     
     text += f"✅ **Язык выбран:** {lang_name}\n\n"
@@ -2707,27 +3491,19 @@ async def register_select_language(update: Update, context: ContextTypes.DEFAULT
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
+    temp_update = Update(update_id=0, callback_query=query)
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error, sending without formatting: {e}")
-            await query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in register_select_language, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
 
 
 async def register_select_currency(update: Update, context: ContextTypes.DEFAULT_TYPE, currency: str):
@@ -2755,7 +3531,7 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
     lang_names = {"ru": "Русский", "ua": "Українська", "en": "English", "cn": "中文"}
     lang_name = lang_names.get(lang, "Русский")
     
-    text = "🛡️ **StealthNET VPN**\n"
+    text = f"🛡️ **{SERVICE_NAME} VPN**\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     
     text += "✅ **Настройки**\n"
@@ -2763,16 +3539,18 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
     text += f"💱 {currency_name}\n\n"
     text += "⏳ Создаем ваш аккаунт..."
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
+    temp_update = Update(update_id=0, callback_query=query)
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await query.edit_message_text(text_clean)
+        await safe_edit_or_send_with_logo(temp_update, context, text_clean)
     else:
         try:
-            await query.edit_message_text(text, parse_mode="Markdown")
+            await safe_edit_or_send_with_logo(temp_update, context, text, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error, sending without formatting: {e}")
-            await query.edit_message_text(clean_markdown_for_cards(text))
+            logger.warning(f"Error in register_select_currency (loading), sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean)
     
     # Проверяем, есть ли реферальный код в контексте
     ref_code = context.user_data.get("ref_code")
@@ -2783,12 +3561,13 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
     if not result:
         text = "❌ **Ошибка регистрации**\n\n"
         text += "Не удалось зарегистрироваться. Попробуйте позже или зарегистрируйтесь на сайте:\n"
-        text += "https://panel.stealthnet.app/register"
+        text += f"{YOUR_SERVER_IP}/register"
         
         keyboard = [[InlineKeyboardButton("🔙 Попробовать снова", callback_data="register_user")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+        temp_update = Update(update_id=0, callback_query=query)
+        await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         return
     
     if result.get("message") == "User already registered":
@@ -2821,7 +3600,7 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
         text += "Сохраните эти данные! Пароль больше не будет показан.\n\n"
         
         text += "🌐 Войти на сайте:\n"
-        text += "https://panel.stealthnet.app\n\n"
+        text += f"{YOUR_SERVER_IP}\n\n"
     
     text += "🎉 Теперь вы можете использовать все функции бота!"
     
@@ -2832,27 +3611,19 @@ async def register_select_currency(update: Update, context: ContextTypes.DEFAULT
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
+    temp_update = Update(update_id=0, callback_query=query)
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error, sending without formatting: {e}")
-            await query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in register_select_currency (success), sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     
     # Сохраняем токен в кэш (если он есть)
     if result.get("token"):
@@ -2901,22 +3672,20 @@ async def activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += f"{get_text('trial_days_received', user_lang)}\n"
             text += f"{get_text('enjoy_vpn', user_lang)}"
             
+            temp_update = Update(update_id=0, callback_query=query)
             try:
-                await query.edit_message_text(
-                    text,
-                    reply_markup=reply_markup,
-                    parse_mode="Markdown"
-                )
+                await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
             except Exception as e:
-                logger.warning(f"Markdown parsing error in activate_trial, sending without formatting: {e}")
-                await query.edit_message_text(
-                    clean_markdown_for_cards(text),
-                    reply_markup=reply_markup
-                )
+                logger.warning(f"Error in activate_trial (success), sending without formatting: {e}")
+                text_clean = clean_markdown_for_cards(text)
+                await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
         else:
             # Если сообщение есть, но не об успехе - показываем его
             message = result.get("message", get_text('error_activating_trial', user_lang))
-            await query.edit_message_text(
+            temp_update = Update(update_id=0, callback_query=query)
+            await safe_edit_or_send_with_logo(
+                temp_update,
+                context,
                 f"❌ **{get_text('error', user_lang)}**\n\n{message}",
                 reply_markup=reply_markup,
                 parse_mode="Markdown"
@@ -2928,22 +3697,20 @@ async def activate_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{get_text('trial_days_received', user_lang)}\n"
         text += f"{get_text('enjoy_vpn', user_lang)}"
         
+        temp_update = Update(update_id=0, callback_query=query)
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error in activate_trial, sending without formatting: {e}")
-            await query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in activate_trial (success 2), sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     else:
         # Если result пустой или нет нужных полей
         error_message = result.get("message", get_text('failed_activate_trial', user_lang)) if result else get_text('failed_activate_trial', user_lang)
-        await query.edit_message_text(
+        temp_update = Update(update_id=0, callback_query=query)
+        await safe_edit_or_send_with_logo(
+            temp_update,
+            context,
             f"❌ **{get_text('error', user_lang)}**\n\n{error_message}",
             reply_markup=reply_markup,
             parse_mode="Markdown"
@@ -2995,10 +3762,18 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
     currency_config = currency_map.get(currency, currency_map["uah"])
     price = tariff.get(currency_config["field"], 0)
     
+    # Получаем баланс пользователя
+    user_data = api.get_user_data(token)
+    balance = user_data.get("balance", 0) if user_data else 0
+    preferred_currency = user_data.get("preferred_currency", currency) if user_data else currency
+    balance_currency_config = currency_map.get(preferred_currency, currency_map["uah"])
+    balance_symbol = balance_currency_config["symbol"]
+    
     text = f"💎 **{get_text('tariff_selected', user_lang)}:** {tariff.get('name', get_text('unknown', user_lang))}\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n\n"
     text += f"💰 **{get_text('price_label', user_lang)}:** {price:.0f} {currency_config['symbol']}\n"
-    text += f"📅 **{get_text('duration_label', user_lang)}:** {tariff.get('duration_days', 0)} {get_text('days', user_lang)}\n\n"
+    text += f"📅 **{get_text('duration_label', user_lang)}:** {tariff.get('duration_days', 0)} {get_text('days', user_lang)}\n"
+    text += f"💳 **Баланс:** {balance:.2f} {balance_symbol}\n\n"
     text += f"**{get_text('payment_methods', user_lang)}**:"
     
     # Получаем доступные способы оплаты из API
@@ -3014,7 +3789,10 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
         'urlpay': '💳 UrlPay',
         'telegram_stars': '⭐ Telegram Stars',
         'monobank': '💳 Monobank',
-        'btcpayserver': '₿ BTCPayServer'
+        'btcpayserver': '₿ BTCPayServer',
+        'tribute': '💳 Tribute',
+        'robokassa': '💳 Robokassa',
+        'freekassa': '💳 Freekassa'
     }
     
     keyboard = []
@@ -3036,8 +3814,25 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
     if row:
         keyboard.append(row)
     
+    # Добавляем кнопку оплаты с баланса, если баланс достаточен
+    can_afford = balance >= price
+    if can_afford:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"💰 {get_text('pay_with_balance', user_lang)} ({price:.0f} {currency_config['symbol']})",
+                callback_data=f"pay_{tariff_id}_balance"
+            )
+        ])
+    else:
+        keyboard.append([
+            InlineKeyboardButton(
+                f"💰 {get_text('pay_with_balance', user_lang)} ({get_text('insufficient_balance', user_lang)})",
+                callback_data=f"pay_{tariff_id}_balance"
+            )
+        ])
+    
     # Если нет доступных способов оплаты
-    if not keyboard:
+    if not keyboard or (len(keyboard) == 1 and not can_afford):
         text += f"\n\n❌ {get_text('no_payment_methods', user_lang)}"
     
     keyboard.append([
@@ -3045,27 +3840,18 @@ async def select_tariff(update: Update, context: ContextTypes.DEFAULT_TYPE, tari
     ])
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    # Если текст содержит карточки, убираем Markdown-форматирование
+    # Используем безопасную функцию для редактирования/отправки
     if has_cards(text):
         text_clean = clean_markdown_for_cards(text)
-        await update.callback_query.edit_message_text(
-            text_clean,
-            reply_markup=reply_markup
-        )
+        await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
     else:
         # Для текста без карточек используем Markdown
         try:
-            await update.callback_query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error in show_tariffs, sending without formatting: {e}")
-            await update.callback_query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in show_tariffs, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(update, context, text_clean, reply_markup=reply_markup)
 
 
 async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tariff_id: int, provider: str):
@@ -3086,6 +3872,62 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
     user_data = api.get_user_data(token)
     user_lang = get_user_lang(user_data, context, token)
     
+    # Если оплата с баланса, используем специальный endpoint
+    if provider == 'balance':
+        await query.answer(f"⏳ Обработка оплаты с баланса...")
+        
+        try:
+            response = api.session.post(
+                f"{FLASK_API_URL}/api/client/purchase-with-balance",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"tariff_id": tariff_id},
+                timeout=30
+            )
+            result = response.json()
+            
+            if response.status_code == 200:
+                text = f"✅ **Тариф активирован!**\n"
+                text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+                text += f"💎 Тариф успешно активирован с баланса!\n"
+                text += f"💰 Остаток баланса: {result.get('balance', 0):.2f}\n\n"
+                text += f"🎉 Подписка продлена!"
+                
+                keyboard = [
+                    [InlineKeyboardButton(f"📊 {get_text('status_button', user_lang)}", callback_data="status")],
+                    [InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                
+                temp_update = Update(update_id=0, callback_query=query)
+                await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+                return
+            else:
+                message = result.get("message", "Ошибка покупки тарифа")
+                keyboard = [[InlineKeyboardButton(f"🔙 {get_text('back_to_tariffs', user_lang)}", callback_data="tariffs")]]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                temp_update = Update(update_id=0, callback_query=query)
+                await safe_edit_or_send_with_logo(
+                    temp_update,
+                    context,
+                    f"❌ **Ошибка**\n\n{message}",
+                    reply_markup=reply_markup,
+                    parse_mode="Markdown"
+                )
+                return
+        except Exception as e:
+            logger.error(f"Error in balance payment: {e}")
+            keyboard = [[InlineKeyboardButton(f"🔙 {get_text('back_to_tariffs', user_lang)}", callback_data="tariffs")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            temp_update = Update(update_id=0, callback_query=query)
+            await safe_edit_or_send_with_logo(
+                temp_update,
+                context,
+                f"❌ **Ошибка**\n\nОшибка при обработке платежа: {str(e)}",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+            return
+    
     await query.answer(f"⏳ {get_text('creating_payment', user_lang)}...")
     
     result = api.create_payment(token, tariff_id, provider)
@@ -3104,25 +3946,275 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, tar
         ]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
+        temp_update = Update(update_id=0, callback_query=query)
         try:
-            await query.edit_message_text(
-                text,
-                reply_markup=reply_markup,
-                parse_mode="Markdown"
-            )
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
         except Exception as e:
-            logger.warning(f"Markdown parsing error in handle_payment, sending without formatting: {e}")
-            await query.edit_message_text(
-                clean_markdown_for_cards(text),
-                reply_markup=reply_markup
-            )
+            logger.warning(f"Error in handle_payment, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
     else:
         message = result.get("message", get_text('error_creating_payment', user_lang))
         keyboard = [[InlineKeyboardButton(f"🔙 {get_text('back_to_tariffs', user_lang)}", callback_data="tariffs")]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        await query.edit_message_text(
+        temp_update = Update(update_id=0, callback_query=query)
+        await safe_edit_or_send_with_logo(
+            temp_update,
+            context,
             f"❌ **{get_text('error', user_lang)}**\n\n{message}",
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+
+
+async def show_topup_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать форму пополнения баланса"""
+    query = update.callback_query
+    if not query:
+        return
+    
+    user = update.effective_user
+    telegram_id = user.id
+    
+    token = get_user_token(telegram_id)
+    if not token:
+        lang = get_user_lang(None, context, token)
+        await query.answer(f"❌ {get_text('auth_error', lang)}")
+        return
+    
+    user_data = api.get_user_data(token)
+    if not user_data:
+        lang = get_user_lang(None, context, token)
+        await query.answer(f"❌ {get_text('failed_to_load', lang)}")
+        return
+    
+    user_lang = get_user_lang(user_data, context, token)
+    balance = user_data.get("balance", 0)
+    preferred_currency = user_data.get("preferred_currency", "uah")
+    currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
+    
+    text = f"💰 **{get_text('top_up_balance', user_lang)}**\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += f"💳 **{get_text('balance', user_lang)}:** {balance:.2f} {currency_symbol}\n\n"
+    text += f"📝 {get_text('enter_amount', user_lang)}:\n\n"
+    text += f"💡 {get_text('select_amount_hint', user_lang)}"
+    
+    # Предустановленные суммы
+    amounts = [100, 500, 1000, 2000, 5000]
+    keyboard = []
+    row = []
+    
+    for amount in amounts:
+        row.append(InlineKeyboardButton(
+            f"{amount} {currency_symbol}",
+            callback_data=f"topup_amount_{amount}"
+        ))
+        if len(row) == 2:
+            keyboard.append(row)
+            row = []
+    
+    if row:
+        keyboard.append(row)
+    
+    # Кнопка для ввода своей суммы
+    keyboard.append([
+        InlineKeyboardButton(f"✏️ {get_text('enter_custom_amount', user_lang)}", callback_data="topup_custom_amount")
+    ])
+    
+    keyboard.append([
+        InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Используем безопасную функцию для редактирования/отправки
+    temp_update = Update(update_id=0, callback_query=query)
+    try:
+        await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+    except Exception as e:
+        logger.warning(f"Error in show_topup_balance, sending without formatting: {e}")
+        text_clean = clean_markdown_for_cards(text)
+        await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
+
+
+async def select_topup_method(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: float):
+    """Выбрать способ пополнения баланса"""
+    # Может быть вызвано как из callback, так и из текстового сообщения
+    query = update.callback_query
+    message = update.message
+    
+    user = update.effective_user
+    telegram_id = user.id
+    
+    token = get_user_token(telegram_id)
+    if not token:
+        lang = get_user_lang(None, context, token)
+        if query:
+            await query.answer(f"❌ {get_text('auth_error', lang)}")
+        elif message:
+            temp_update = Update(update_id=0, message=message)
+            await reply_with_logo(temp_update, f"❌ {get_text('auth_error', lang)}")
+        return
+    
+    user_data = api.get_user_data(token)
+    user_lang = get_user_lang(user_data, context, token)
+    preferred_currency = user_data.get("preferred_currency", "uah") if user_data else "uah"
+    currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
+    
+    text = f"💰 **{get_text('top_up_balance', user_lang)}**\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += f"💵 **{get_text('amount', user_lang)}:** {amount:.0f} {currency_symbol}\n\n"
+    text += f"**{get_text('select_topup_method', user_lang)}**:"
+    
+    # Получаем доступные способы оплаты
+    available_methods = api.get_available_payment_methods()
+    
+    payment_names = {
+        'crystalpay': '💳 CrystalPay',
+        'heleket': '₿ Heleket',
+        'yookassa': '💳 YooKassa',
+        'platega': '💳 Platega',
+        'mulenpay': '💳 Mulenpay',
+        'urlpay': '💳 UrlPay',
+        'telegram_stars': '⭐ Telegram Stars',
+        'monobank': '💳 Monobank',
+        'btcpayserver': '₿ BTCPayServer',
+        'tribute': '💳 Tribute',
+        'robokassa': '💳 Robokassa',
+        'freekassa': '💳 Freekassa'
+    }
+    
+    keyboard = []
+    row = []
+    
+    for method in available_methods:
+        if method in payment_names:
+            row.append(InlineKeyboardButton(
+                payment_names[method],
+                callback_data=f"topup_pay_{amount}_{method}"
+            ))
+            if len(row) == 2:
+                keyboard.append(row)
+                row = []
+    
+    if row:
+        keyboard.append(row)
+    
+    keyboard.append([
+        InlineKeyboardButton(f"🔙 {get_text('back', user_lang)}", callback_data="topup_balance")
+    ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Если это callback query, редактируем сообщение
+    if query:
+        temp_update = Update(update_id=0, callback_query=query)
+        try:
+            await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+        except Exception as e:
+            logger.warning(f"Error in select_topup_method, sending without formatting: {e}")
+            text_clean = clean_markdown_for_cards(text)
+            await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
+    # Если это текстовое сообщение, отправляем новое
+    elif message:
+        temp_update = Update(update_id=0, message=message)
+        try:
+            await reply_with_logo(
+                temp_update,
+                text,
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logger.warning(f"Markdown parsing error in select_topup_method: {e}")
+            await reply_with_logo(
+                temp_update,
+                clean_markdown_for_cards(text),
+                reply_markup=reply_markup
+            )
+
+
+async def handle_topup_payment(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: float, provider: str):
+    """Обработать создание платежа на пополнение баланса"""
+    query = update.callback_query
+    if not query:
+        return
+    
+    user = update.effective_user
+    telegram_id = user.id
+    
+    token = get_user_token(telegram_id)
+    if not token:
+        lang = get_user_lang(None, context, token)
+        await query.answer(f"❌ {get_text('auth_error', lang)}")
+        return
+    
+    user_data = api.get_user_data(token)
+    user_lang = get_user_lang(user_data, context, token)
+    preferred_currency = user_data.get("preferred_currency", "uah") if user_data else "uah"
+    currency_symbol = {"uah": "₴", "rub": "₽", "usd": "$"}.get(preferred_currency, "₴")
+    
+    await query.answer(f"⏳ {get_text('creating_payment', user_lang)}...")
+    
+    try:
+        response = api.session.post(
+            f"{FLASK_API_URL}/api/client/create-payment",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "type": "balance_topup",
+                "amount": amount,
+                "currency": preferred_currency,
+                "payment_provider": provider
+            },
+            timeout=30
+        )
+        
+        result = response.json()
+        
+        if response.status_code == 200 and result.get("payment_url"):
+            payment_url = result["payment_url"]
+            text = f"💳 **{get_text('balance_topup_created', user_lang)}**\n"
+            text += "━━━━━━━━━━━━━━━━━━━━\n\n"
+            text += f"💵 **{get_text('amount', user_lang)}:** {amount:.0f} {currency_symbol}\n\n"
+            text += f"{get_text('go_to_payment_text', user_lang)}:\n\n"
+            text += f"`{payment_url}`\n\n"
+            text += f"{get_text('after_payment', user_lang)}"
+            
+            keyboard = [
+                [InlineKeyboardButton(f"💳 {get_text('go_to_payment_button', user_lang)}", url=payment_url)],
+                [InlineKeyboardButton(f"🔙 {get_text('main_menu_button', user_lang)}", callback_data="main_menu")]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            temp_update = Update(update_id=0, callback_query=query)
+            try:
+                await safe_edit_or_send_with_logo(temp_update, context, text, reply_markup=reply_markup, parse_mode="Markdown")
+            except Exception as e:
+                logger.warning(f"Error in handle_topup_payment, sending without formatting: {e}")
+                text_clean = clean_markdown_for_cards(text)
+                await safe_edit_or_send_with_logo(temp_update, context, text_clean, reply_markup=reply_markup)
+        else:
+            message = result.get("message", "Ошибка создания платежа")
+            keyboard = [[InlineKeyboardButton(f"🔙 {get_text('back', user_lang)}", callback_data="topup_balance")]]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            temp_update = Update(update_id=0, callback_query=query)
+            await safe_edit_or_send_with_logo(
+                temp_update,
+                context,
+                f"❌ **Ошибка**\n\n{message}",
+                reply_markup=reply_markup,
+                parse_mode="Markdown"
+            )
+    except Exception as e:
+        logger.error(f"Error in topup payment: {e}")
+        keyboard = [[InlineKeyboardButton(f"🔙 {get_text('back', user_lang)}", callback_data="topup_balance")]]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        temp_update = Update(update_id=0, callback_query=query)
+        await safe_edit_or_send_with_logo(
+            temp_update,
+            context,
+            f"❌ **Ошибка**\n\nОшибка при создании платежа: {str(e)}",
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
@@ -3172,7 +4264,8 @@ def main():
                 user_data["waiting_for_ticket_subject"] = False
                 user_data["waiting_for_ticket_message"] = True
                 
-                await update.message.reply_text(
+                await reply_with_logo(
+                    update,
                     "💬 **Создание тикета**\n\n"
                     "Тема сохранена. Теперь отправьте текст сообщения:",
                     parse_mode="Markdown"
@@ -3197,7 +4290,8 @@ def main():
                         ticket_id = result.get("id")
                     
                     if ticket_id:
-                        await update.message.reply_text(
+                        await reply_with_logo(
+                            update,
                             f"✅ **Тикет создан!**\n\n"
                             f"Номер тикета: #{ticket_id}\n"
                             f"Тема: {subject}\n\n"
@@ -3207,12 +4301,14 @@ def main():
                         )
                     else:
                         error_msg = result.get("message", "Ошибка создания тикета") if result else "Ошибка создания тикета"
-                        await update.message.reply_text(
+                        await reply_with_logo(
+                            update,
                             f"❌ **Ошибка**\n\n{error_msg}",
                             parse_mode="Markdown"
                         )
                 else:
-                    await update.message.reply_text(
+                    await reply_with_logo(
+                        update,
                         "❌ Ошибка авторизации. Используйте /start для повторной авторизации."
                     )
                 
@@ -3232,7 +4328,8 @@ def main():
                     result = api.reply_to_ticket(token, ticket_id, message)
                     
                     if result.get("id") or result.get("success"):
-                        await update.message.reply_text(
+                        await reply_with_logo(
+                            update,
                             f"✅ **Ответ отправлен!**\n\n"
                             f"Тикет #{ticket_id}\n\n"
                             f"Ваш ответ был добавлен в тикет.",
@@ -3240,24 +4337,163 @@ def main():
                         )
                     else:
                         error_msg = result.get("message", "Ошибка отправки ответа") if result else "Ошибка отправки ответа"
-                        await update.message.reply_text(
+                        await reply_with_logo(
+                            update,
                             f"❌ **Ошибка**\n\n{error_msg}",
                             parse_mode="Markdown"
                         )
                 else:
-                    await update.message.reply_text(
+                    await reply_with_logo(
+                        update,
                         "❌ Ошибка авторизации. Используйте /start для повторной авторизации."
                     )
                 
                 # Очищаем состояние
                 user_data.pop("waiting_for_ticket_reply", None)
                 user_data.pop("reply_ticket_id", None)
+            
+            elif user_data.get("waiting_for_topup_amount"):
+                # Обрабатываем ввод суммы для пополнения баланса
+                user = update.effective_user
+                telegram_id = user.id
+                
+                token = get_user_token(telegram_id)
+                user_data_api = api.get_user_data(token) if token else None
+                user_lang = get_user_lang(user_data_api, context, token)
+                
+                try:
+                    amount_text = update.message.text.strip()
+                    # Удаляем все нецифровые символы кроме точки и запятой
+                    amount_text = amount_text.replace(",", ".").replace(" ", "")
+                    amount = float(amount_text)
+                    
+                    if amount <= 0:
+                        await reply_with_logo(
+                            update,
+                            f"❌ {get_text('amount_too_small', user_lang)}"
+                        )
+                        return
+                    
+                    # Очищаем состояние
+                    user_data.pop("waiting_for_topup_amount", None)
+                    
+                    # Переходим к выбору способа оплаты
+                    await select_topup_method(update, context, amount)
+                    
+                except ValueError:
+                    await reply_with_logo(
+                        update,
+                        f"❌ {get_text('invalid_amount_format', user_lang)}"
+                    )
     
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
+    # Обработчик для Telegram Stars - PreCheckoutQuery (подтверждение платежа)
+    async def pre_checkout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик подтверждения платежа Telegram Stars"""
+        query = update.pre_checkout_query
+        if not query:
+            return
+        
+        order_id = query.invoice_payload
+        logger.info(f"PreCheckoutQuery received: order_id={order_id}, query_id={query.id}")
+        
+        # Подтверждаем все платежи - вебхук проверит статус при successful_payment
+        # Это необходимо, чтобы Telegram не показывал ошибку ожидания
+        try:
+            await query.answer(ok=True)
+            logger.info(f"PreCheckoutQuery confirmed for order_id={order_id}")
+        except Exception as e:
+            logger.error(f"Error answering PreCheckoutQuery: {e}")
+            try:
+                await query.answer(ok=False, error_message="Payment verification error")
+            except:
+                pass
+    
+    # Обработчик для Telegram Stars - SuccessfulPayment (успешный платеж)
+    async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Обработчик успешного платежа Telegram Stars"""
+        message = update.message
+        if not message or not message.successful_payment:
+            return
+        
+        successful_payment = message.successful_payment
+        order_id = successful_payment.invoice_payload
+        
+        logger.info(f"Successful payment received: order_id={order_id}")
+        
+        # Отправляем уведомление пользователю
+        user = update.effective_user
+        telegram_id = user.id
+        
+        token = get_user_token(telegram_id)
+        if not token:
+            await message.reply_text("❌ Ошибка авторизации")
+            return
+        
+        user_data = api.get_user_data(token)
+        user_lang = get_user_lang(user_data, context, token)
+        
+        # Платеж обрабатывается через вебхук, просто уведомляем пользователя
+        text = f"✅ **{get_text('payment_successful', user_lang)}**\n\n"
+        text += f"💳 {get_text('payment_processed', user_lang)}\n\n"
+        text += f"🔄 {get_text('subscription_updating', user_lang)}"
+        
+        await reply_with_logo(update, text, parse_mode="Markdown")
+        
+        # Даем время вебхуку обработать платеж, затем обновляем статус
+        import asyncio
+        await asyncio.sleep(2)
+        
+        # Обновляем данные пользователя - создаем временный callback для показа главного меню
+        # Вебхук уже обработал платеж, подписка обновлена
+        from telegram import CallbackQuery
+        # Создаем временный callback query для показа главного меню
+        temp_query = CallbackQuery(
+            id=0,
+            from_user=user,
+            chat_instance=0,
+            message=message,
+            data="main_menu"
+        )
+        temp_update = Update(update_id=update.update_id, callback_query=temp_query)
+        await button_callback(temp_update, context)
+    
+    # Регистрируем обработчики Telegram Stars
+    application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
+    
+    # Добавляем обработчик ошибок ПЕРЕД запуском
+    async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обработчик ошибок"""
+        error = context.error
+        
+        # Обрабатываем конфликт обновлений
+        if isinstance(error, Conflict):
+            logger.warning("Bot conflict detected: terminated by other getUpdates request")
+            logger.warning("This usually means multiple bot instances are running.")
+            logger.warning("Make sure only one instance of the bot is running.")
+            logger.warning("If using systemd service, check if bot is already running: systemctl status client-bot")
+            return  # Не логируем как критическую ошибку
+        
+        # Логируем другие ошибки
+        logger.error(f"Exception while handling an update: {error}", exc_info=error)
+    
+    application.add_error_handler(error_handler)
+    
     # Запускаем бота
     logger.info("Бот запущен и готов к работе!")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Очищаем предыдущие обновления перед запуском polling
+    try:
+        logger.info("Starting bot with polling...")
+        # Используем drop_pending_updates=True для очистки старых обновлений
+        application.run_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=True  # Очищаем старые обновления при запуске
+        )
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
+        raise
 
 
 if __name__ == "__main__":

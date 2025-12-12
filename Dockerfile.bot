@@ -1,0 +1,24 @@
+FROM python:3.11-slim
+
+# Устанавливаем рабочую директорию
+WORKDIR /app
+
+# Копируем файлы зависимостей
+COPY client_bot_requirements.txt .
+
+# Устанавливаем зависимости Python для бота
+RUN pip install --no-cache-dir -r client_bot_requirements.txt
+
+# Копируем файлы бота
+COPY client_bot.py .
+COPY logo.png .
+
+# Создаем директорию для логов
+RUN mkdir -p logs
+
+# Устанавливаем права на выполнение
+RUN chmod +x client_bot.py
+
+# Команда запуска бота
+CMD ["python3", "client_bot.py"]
+
