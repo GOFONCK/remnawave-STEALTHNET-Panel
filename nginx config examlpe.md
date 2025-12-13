@@ -4,7 +4,7 @@
 ---
 
 
-# server {
+ server #Начало
 
     server_name panel.stealthnet.app; # ❗️ ВАШ IP-АДРЕС СЮДА
 
@@ -88,6 +88,7 @@ server {
 
 
 }
+
 
 
 
