@@ -76,7 +76,7 @@ docker compose version
 # Клонируем проект из GitHub
 cd /opt
 git clone https://github.com/GOFONCK/remnawave-STEALTHNET-Panel.git
-cd STEALTHNET-Admin-Panel
+cd remnawave-STEALTHNET-Panel
 
 # Или если копируете файлы вручную:
 # mkdir -p /opt/STEALTHNET-Admin-Panel
@@ -797,5 +797,6 @@ docker compose logs -f
 ---
 
 **Удачной установки!** 🚀
+
 
 
