@@ -24,7 +24,7 @@
         /* Шапка */
         .header { background-color: #0B0F19; padding: 30px 0; text-align: center; }
         .logo-text { color: #ffffff; font-size: 24px; font-weight: 800; letter-spacing: 2px; text-decoration: none; }
-        .logo-accent { color: #3F69FF; }
+        .logo-accent { color: {{ branding.accent_color or '#3F69FF' }}; }
 
         /* Контент */
         .content { padding: 40px 30px; text-align: center; }
@@ -72,7 +72,7 @@
         <table class="main-table" width="100%">
             <tr>
                 <td class="header">
-                    <span class="logo-text">STEALTH<span class="logo-accent">NET</span></span>
+                    <span class="logo-text">{{ branding.site_name or service_name }}</span>
                 </td>
             </tr>
 
@@ -81,7 +81,7 @@
                     <h1 class="h1">Добро пожаловать!</h1>
                     
                     <p class="text">
-                        Спасибо за регистрацию в StealthNET. Вы в одном шаге от безопасного и свободного интернета.
+                        Спасибо за регистрацию в {{ service_name }}. Вы в одном шаге от безопасного и свободного интернета.
                     </p>
                     
                     <div class="bonus-box">
@@ -110,7 +110,7 @@
         </table>
         
         <div class="footer">
-            &copy; 2025 StealthNET. Все права защищены.<br>
+            &copy; 2025 {{ branding.site_name or service_name }}. Все права защищены.<br>
             Вы получили это письмо, так как зарегистрировались на нашем сервисе.
         </div>
     </center>

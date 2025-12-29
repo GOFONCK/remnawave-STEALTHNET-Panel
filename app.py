@@ -39,6 +39,7 @@ FERNET_KEY_STR = os.getenv("FERNET_KEY")
 BOT_API_URL = os.getenv("BOT_API_URL", "")  # URL веб-API бота (например, http://localhost:8080)
 BOT_API_TOKEN = os.getenv("BOT_API_TOKEN", "")  # Токен для доступа к API бота
 TELEGRAM_BOT_NAME = os.getenv("TELEGRAM_BOT_NAME", "")  # Имя бота для Telegram Login Widget
+SERVICE_NAME = os.getenv("SERVICE_NAME", "StealthNET")  # Название сервиса для брендинга
 
 # Cookies для Remnawave API (если панель требует cookies вместо/в дополнение к Bearer токену)
 # Формат: COOKIES={"cookie_name":"cookie_value"} или COOKIES={"aEmFnBcC":"WbYWpixX"}
@@ -275,8 +276,11 @@ class SystemSetting(db.Model):
 class BrandingSetting(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     logo_url = db.Column(db.String(500), nullable=True)  # URL логотипа
-    site_name = db.Column(db.String(100), default='StealthNET', nullable=False)  # Название сайта
+    site_name = db.Column(db.String(100), default=SERVICE_NAME, nullable=False)  # Название сайта
     site_subtitle = db.Column(db.String(200), nullable=True)  # Подзаголовок
+    primary_color = db.Column(db.String(7), default='#3F69FF', nullable=False)  # Основной цвет (hex)
+    secondary_color = db.Column(db.String(7), default='#ffffff', nullable=False)  # Вторичный цвет
+    accent_color = db.Column(db.String(7), default='#3F69FF', nullable=False)  # Акцентный цвет
     login_welcome_text = db.Column(db.String(200), nullable=True)  # Текст приветствия на странице входа
     register_welcome_text = db.Column(db.String(200), nullable=True)  # Текст приветствия на странице регистрации
     footer_text = db.Column(db.String(200), nullable=True)  # Текст в футере
@@ -670,7 +674,8 @@ def public_register():
         db.session.commit()
         
         url = f"{YOUR_SERVER_IP_OR_DOMAIN}/verify?token={verif_token}"
-        html = render_template('email_verification.html', verification_url=url)
+        branding = BrandingSetting.query.first() or BrandingSetting(site_name=SERVICE_NAME, primary_color="#3F69FF", secondary_color="#ffffff", accent_color="#3F69FF")
+        html = render_template('email_verification.html', verification_url=url, branding=branding, service_name=SERVICE_NAME)
         threading.Thread(target=send_email_in_background, args=(app.app_context(), email, "Подтвердите свой адрес электронной почты", html)).start()
 
         if referrer:
@@ -779,14 +784,14 @@ def forgot_password():
         user_email = user.email  # Сохраняем email пользователя в отдельную переменную
         print(f"[FORGOT PASSWORD] Email пользователя для отправки: {user_email}")
         password_label = "Ваш пароль" if password_source == "existing" else "Ваш новый пароль"
-        subject = "Восстановление пароля StealthNET"
+        subject = f"Восстановление пароля {SERVICE_NAME}"
         html_body = f"""
         <html>
         <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
             <div style="max-width: 600px; margin: 0 auto; padding: 20px;">
                 <h2 style="color: #4a90e2;">Восстановление пароля</h2>
                 <p>Здравствуйте!</p>
-                <p>Вы запросили восстановление пароля для вашего аккаунта StealthNET.</p>
+                <p>Вы запросили восстановление пароля для вашего аккаунта {SERVICE_NAME}.</p>
                 <p><strong>{password_label}:</strong></p>
                 <div style="background-color: #f5f5f5; padding: 15px; border-radius: 5px; margin: 20px 0; font-family: monospace; font-size: 18px; text-align: center; letter-spacing: 2px;">
                     {password_to_send}
@@ -794,7 +799,7 @@ def forgot_password():
                 <p style="color: #666; font-size: 14px;">{"Используйте этот пароль для входа в систему." if password_source == "existing" else "Рекомендуем изменить этот пароль после входа в систему."}</p>
                 <p style="color: #666; font-size: 14px;">Если вы не запрашивали восстановление пароля, проигнорируйте это письмо.</p>
                 <hr style="border: none; border-top: 1px solid #eee; margin: 30px 0;">
-                <p style="color: #999; font-size: 12px;">© 2025 StealthNET. Privacy First.</p>
+                <p style="color: #999; font-size: 12px;">© 2025 {SERVICE_NAME}. Privacy First.</p>
             </div>
         </body>
         </html>
@@ -5110,7 +5115,8 @@ def send_broadcast(current_admin):
             return jsonify({"message": "No recipients found"}), 400
         
         # Формируем HTML письма используя шаблон
-        html_body = render_template('email_broadcast.html', subject=subject, message=message)
+        branding = BrandingSetting.query.first() or BrandingSetting(site_name=SERVICE_NAME, primary_color="#3F69FF", secondary_color="#ffffff", accent_color="#3F69FF")
+        html_body = render_template('email_broadcast.html', subject=subject, message=message, branding=branding, service_name=SERVICE_NAME)
         
         # Отправляем письма в фоновом режиме
         sent_count = 0
@@ -5678,8 +5684,11 @@ def branding_settings(current_admin):
     if request.method == 'GET':
         return jsonify({
             "logo_url": b.logo_url or "",
-            "site_name": b.site_name or "StealthNET",
+            "site_name": b.site_name or SERVICE_NAME,
             "site_subtitle": b.site_subtitle or "",
+            "primary_color": b.primary_color or "#3F69FF",
+            "secondary_color": b.secondary_color or "#ffffff",
+            "accent_color": b.accent_color or "#3F69FF",
             "login_welcome_text": b.login_welcome_text or "",
             "register_welcome_text": b.register_welcome_text or "",
             "footer_text": b.footer_text or "",
@@ -5703,9 +5712,15 @@ def branding_settings(current_admin):
         if 'logo_url' in data:
             b.logo_url = data['logo_url'] or None
         if 'site_name' in data:
-            b.site_name = data['site_name'] or "StealthNET"
+            b.site_name = data['site_name'] or SERVICE_NAME
         if 'site_subtitle' in data:
             b.site_subtitle = data['site_subtitle'] or None
+        if 'primary_color' in data:
+            b.primary_color = data['primary_color'] or "#3F69FF"
+        if 'secondary_color' in data:
+            b.secondary_color = data['secondary_color'] or "#ffffff"
+        if 'accent_color' in data:
+            b.accent_color = data['accent_color'] or "#3F69FF"
         if 'login_welcome_text' in data:
             b.login_welcome_text = data['login_welcome_text'] or None
         if 'register_welcome_text' in data:
@@ -5750,8 +5765,11 @@ def public_branding():
     
     return jsonify({
         "logo_url": b.logo_url or "",
-        "site_name": b.site_name or "StealthNET",
+        "site_name": b.site_name or SERVICE_NAME,
         "site_subtitle": b.site_subtitle or "",
+        "primary_color": b.primary_color or "#3F69FF",
+        "secondary_color": b.secondary_color or "#ffffff",
+        "accent_color": b.accent_color or "#3F69FF",
         "login_welcome_text": b.login_welcome_text or "",
         "register_welcome_text": b.register_welcome_text or "",
         "footer_text": b.footer_text or "",
@@ -9675,7 +9693,8 @@ def resend_verif():
     u = User.query.filter_by(email=email).first()
     if u and not u.is_verified and u.verification_token:
         url = f"{YOUR_SERVER_IP_OR_DOMAIN}/verify?token={u.verification_token}"
-        html = render_template('email_verification.html', verification_url=url)
+        branding = BrandingSetting.query.first() or BrandingSetting(site_name=SERVICE_NAME, primary_color="#3F69FF", secondary_color="#ffffff", accent_color="#3F69FF")
+        html = render_template('email_verification.html', verification_url=url, branding=branding, service_name=SERVICE_NAME)
         threading.Thread(target=send_email_in_background, args=(app.app_context(), u.email, "Verify Email", html)).start()
     return jsonify({"message": "Sent"}), 200
 
@@ -10618,8 +10637,11 @@ def init_database():
             branding_setting = BrandingSetting(
                 id=1,
                 logo_url=None,
-                site_name='StealthNET',
+                site_name=SERVICE_NAME,
                 site_subtitle=None,
+                primary_color="#3F69FF",
+                secondary_color="#ffffff",
+                accent_color="#3F69FF",
                 login_welcome_text=None,
                 register_welcome_text=None,
                 footer_text=None,
