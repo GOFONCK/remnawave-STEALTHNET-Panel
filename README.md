@@ -413,11 +413,9 @@ docker compose logs api
 
 Мы принимаем донаты в криптовалюте. Пожалуйста, убедитесь, что вы отправляете средства в подходящей сети для каждого адреса.
 
-**Адрес для (TRX/USDT-TRC20 и аналогичных):** `TWG5eK5Yc4BRHhaMc1GncPtj2pP3mfJ7ag`
+**Адрес для (TRX/USDT-TRC20 и аналогичных):** `TY1ZATZ3Gtwz6hxv4j2mcgiZKc76o6V4Hp`
 
-**Адрес для (Ethereum / BSC / EVM-совместимые сети):**
-- `0x7cfD59365ee3C97576fe387886b55298c9CeAc5E`
-- `0x23cB77312DC0163d80d8bf23df272aCD21177846`
+
 
 **Или звездами Telegram ⭐️**
 
